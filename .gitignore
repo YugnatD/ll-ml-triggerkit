@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+# training / stats outputs
+trained_models/
+*.keras
+*.weights.h5
+*.npy
+*.h5
+*.hdf5

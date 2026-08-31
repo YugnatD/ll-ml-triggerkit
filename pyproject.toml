@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ll-ml-triggerkit"
+version = "0.1.0"
+description = "Trainable low-level ML trigger chains for Cherenkov cameras (SST-1M / DigiCam)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tanguy Dietrich" }]
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "h5py",
+    "hdf5plugin",
+    "matplotlib",
+    "astropy",
+    "setproctitle",
+    "tensorflow>=2.16",
+    "keras>=3",
+    "ctapipe",
+]
+
+[project.optional-dependencies]
+# Hex CNN bodies (models/hexcnn.py, SequentialBody hex layers).
+hexcnn = ["keras-hexagdly"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+triggerkit = ["**/*.json"]
