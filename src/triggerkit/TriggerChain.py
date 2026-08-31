@@ -465,96 +465,38 @@ class TriggerChain:
         output_folder="trained_models",
         base_name="trigger_chain",
         callbacks=None,
-        verbose=1
+        verbose=1,
+        dataset=None,
     ):
 
     # check the folder exist
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    cfg_train = SimTelTFDatasetConfig(
-        batch_size=batch_size,
-        shuffle_samples=True, # True to decorrelate batches and help generalization. 
-        sample_shuffle_buffer=10000,
-        seed=1337,
-        load_ram=load_ram,
-        interleave_files=True,
-        waveform_level="r0",
-        gamma_tel_id_only=tel_id_only,
-        # Evaluate on everything
-        gamma_n_pe_max=n_pe_max_train, # only train on n_pe with less than 350
-        gamma_n_pe_min=n_pe_min_train,
-        gamma_skip_if_missing_n_pe=True,
-        include_event_features=True,
-        event_feature_keys = (
-            "n_pe", "ev_time", "energy", "azimuth", "altitude",
-            "h_first_int", "xmax", "xcore", "ycore"
-        ),
-        nsb_skip_original_events=False,
-        nsb_roll_copies=0,
-        nsb_roll_axis=1,
-        # Random per-batch NSB pixel-roll augmentation; a seed distinct from
-        # cfg_val's so the train/val "watermark" rotations aren't correlated.
-        nsb_roll_augment=True,
-        nsb_roll_seed=1337,
-        max_gamma_samples_total=max_gamma_samples_train,
-        max_nsb_samples_total=max_nsb_samples_train,
-
-        repeat=False,
-
-        ignore_errors=True
-    )
-
-    cfg_val = SimTelTFDatasetConfig(
-        batch_size=batch_size,
-        shuffle_samples=False,
-        sample_shuffle_buffer=10000,
-        seed=1337,
-        load_ram=load_ram,
-        interleave_files=True,
-        waveform_level="r0",
-        gamma_tel_id_only=tel_id_only,
-        # Evaluate on everything
-        gamma_n_pe_max=n_pe_max_val, # only train on n_pe with less than 350
-        gamma_n_pe_min=n_pe_min_val,
-        gamma_skip_if_missing_n_pe=True,
-        include_event_features=True,
-        event_feature_keys = (
-            "n_pe", "ev_time", "energy", "azimuth", "altitude",
-            "h_first_int", "xmax", "xcore", "ycore"
-        ),
-        nsb_skip_original_events=False,
-        nsb_roll_copies=0,
-        nsb_roll_axis=1,
-        nsb_roll_augment=True,
-        nsb_roll_seed=4242,
-        max_gamma_samples_total=max_gamma_samples_val,
-        max_nsb_samples_total=max_nsb_samples_val,
-
-        repeat=False,
-
-        ignore_errors=True
-    )
-
-    percent_validation = max(0.0, min(1.0, percent_validation))
-    num_files = len(self.simtel_path)
-    num_val_files = int(num_files * percent_validation)
-
-    # generate the training and validation dataset from the simtel files
-    train_dataset = SimTelTFDataset(
-        # take the first percent_validation of the files for validation
-        gamma_files=self.simtel_path[:-num_val_files] if percent_validation > 0.0 else self.simtel_path,
-        nsb_files=self.simtel_nsb_path,
-        opener_cls=AsyncFileOpenerProcess,
-        config=cfg_train
-    )
-
-    val_dataset = SimTelTFDataset(
-        gamma_files=self.simtel_path[-num_val_files:] if percent_validation > 0.0 else [],
-        nsb_files=self.simtel_nsb_path,
-        opener_cls=AsyncFileOpenerProcess,
-        config=cfg_val
-    )
+    # Dataset source of truth. When no TriggerDataset is passed, build the
+    # default one from this chain's files + the legacy per-split kwargs, so
+    # existing callers keep working unchanged. A caller wanting cross-validation
+    # folds, augmentation, or auxiliary targets builds a TriggerDataset itself
+    # and passes it in.
+    if dataset is None:
+        from triggerkit.data.dataset import TriggerDataset
+        dataset = TriggerDataset(
+            self.simtel_path, self.simtel_nsb_path,
+            batch_size=batch_size,
+            tel_id_only=tel_id_only,
+            n_pe_min_train=n_pe_min_train,
+            n_pe_max_train=n_pe_max_train,
+            n_pe_min_val=n_pe_min_val,
+            n_pe_max_val=n_pe_max_val,
+            max_gamma_samples_train=max_gamma_samples_train,
+            max_gamma_samples_val=max_gamma_samples_val,
+            max_nsb_samples_train=max_nsb_samples_train,
+            max_nsb_samples_val=max_nsb_samples_val,
+            load_ram=load_ram,
+            percent_validation=percent_validation,
+            seed=1337,
+        )
+    train_ds, val_ds = dataset.train_val_datasets()
 
     if callbacks is None:
         callbacks = []
@@ -594,8 +536,7 @@ class TriggerChain:
 
     callbacks.append(_GracefulStopCallback())
 
-    train_ds = train_dataset.dataset()
-    val_ds = val_dataset.dataset()
+    # train_ds / val_ds already come from the TriggerDataset above (val_ds may be None).
     # Match dataset inputs to model signature (waveform only vs waveform+pedestal)
     expects_baseline = True
     try:
@@ -624,7 +565,9 @@ class TriggerChain:
 
     print("Loading training and validation datasets into memory...")
     train_ds_waveform = train_ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE)
-    val_ds_waveform = val_ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE)
+    val_ds_waveform = (
+        val_ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE) if val_ds is not None else None
+    )
     print("Datasets loaded.")
 
     # add grad_norm_logger callback to log the gradient norms of each layer during training
@@ -643,7 +586,10 @@ class TriggerChain:
             nsb_count += np.count_nonzero(lbl == 0)
         print(f"{name} dataset: {total} samples, {gamma_count} gamma, {nsb_count} nsb")
     print_dataset_info(train_ds_waveform, "Training")
-    print_dataset_info(val_ds_waveform, "Validation")
+    if val_ds_waveform is not None:
+        print_dataset_info(val_ds_waveform, "Validation")
+    else:
+        print("No validation split (percent_validation=0 or empty fold).")
 
     print("Starting training...")
     history = None
