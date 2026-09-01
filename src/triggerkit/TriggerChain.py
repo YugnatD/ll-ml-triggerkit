@@ -1022,9 +1022,35 @@ class TriggerChain:
                          nsb_roll_copies=0,
                          nsb_skip_original_events=True,
                          ignore_errors=True,
+                         folds=None,
+                         max_gamma_events=None,
+                         max_nsb_events=None,
                          ):
+    # Cross-validation folds (leakage detector). `folds` is an optional list of
+    # augment.Fold; each pairs a gamma pixel-index permutation with an NSB one
+    # (rotation / roll / shuffle -- see triggerkit.augment). All folds are written
+    # into ONE HDF5: every event row carries a `fold` column, and per-fold
+    # summaries live in the /folds group. StatPlotter can then aggregate all folds
+    # or slice a single one. `folds=None` is the plain single-pass run (one fold
+    # named "all"), byte-for-byte compatible with the old fold-free output.
+    if folds is None:
+        fold_plan = [("all", None, None, {})]
+    else:
+        fold_plan = [(f.name, f.gamma_index, f.nsb_index, getattr(f, "config", {}))
+                     for f in folds]
+        print(f"Cross-validation: {len(fold_plan)} folds -> "
+              f"{[name for name, *_ in fold_plan]}")
 
+    # Optional per-fold event caps. Each fold rebuilds the dataset (the opener
+    # resets its per-label quota on every dataset() build), so these bound the
+    # gamma / NSB events processed *in each fold* -- e.g. max_gamma_events=50_000,
+    # max_nsb_events=100_000 gives every fold at most 50k gammas + 100k NSB.
+    # None = no cap (use all available events). The gamma count is measured after
+    # the tel_id_only filter; the NSB count is source events (with augmentation
+    # off, that is exactly the NSB events seen).
     cfg = SimTelTFDatasetConfig(
+        max_gamma_samples_total=max_gamma_events,
+        max_nsb_samples_total=max_nsb_events,
         batch_size=batch_size,
         shuffle_samples=False,
         sample_shuffle_buffer=10000,
@@ -1057,39 +1083,39 @@ class TriggerChain:
     if not expects_baseline:
         print("Model expects 1 input; using waveform only (ignoring pedestal).")
 
-    def pack(features, label):
-        wf  = tf.cast(features["waveform"], tf.uint16)
-        ped = tf.cast(features["pedestal"], tf.int32)
+    def make_pack(reindex, gi, ni):
+        """Build the tf.data map fn for one fold (closes over its reindexing)."""
+        def pack(features, label):
+            wf  = tf.cast(features["waveform"], tf.uint16)
+            ped = tf.cast(features["pedestal"], tf.int32)
 
-        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
-        ped = tf.reshape(ped, (-1, self.num_pixels))
+            wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
+            ped = tf.reshape(ped, (-1, self.num_pixels))
 
-        y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
+            y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
 
-        extra = {
-            "event_id": tf.reshape(tf.cast(features["event_id"], tf.int64), (-1,)),
-            "tel_id":   tf.reshape(tf.cast(features["tel_id"], tf.int32), (-1,)),
-            "n_pe":     tf.reshape(tf.cast(features["n_pe"], tf.float32), (-1,)),
-        }
-        for key in STATS_EVENT_FLOAT_KEYS:
-            extra[key] = tf.reshape(tf.cast(features[key], tf.float32), (-1,))
-        if expects_baseline:
-            return (wf, ped), y, extra
-        return wf, y, extra
-    
-    
+            # Per-class pixel reindex for a cross-validation fold: pick the gamma
+            # permutation on gamma rows and the NSB one on NSB rows, then gather
+            # the same indices from both waveform and pedestal (the baseline
+            # rotates with the camera).
+            if reindex:
+                sel = tf.where(tf.equal(y, 1)[:, None], gi[None, :], ni[None, :])  # (B, P)
+                wf  = tf.gather(wf, sel, batch_dims=1)
+                ped = tf.gather(ped, sel, batch_dims=1)
 
-    print("Computing statistics with current model...")
-    stats_dataset = SimTelTFDataset(
-        gamma_files=self.simtel_path,
-        nsb_files=self.simtel_nsb_path,
-        opener_cls=AsyncFileOpenerProcess,
-        config=cfg
-    )
-    # now compute the real statistics with the (possibly) adjusted threshold
-    stats_ds = stats_dataset.dataset()
-    ds = stats_ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+            extra = {
+                "event_id": tf.reshape(tf.cast(features["event_id"], tf.int64), (-1,)),
+                "tel_id":   tf.reshape(tf.cast(features["tel_id"], tf.int32), (-1,)),
+                "n_pe":     tf.reshape(tf.cast(features["n_pe"], tf.float32), (-1,)),
+            }
+            for key in STATS_EVENT_FLOAT_KEYS:
+                extra[key] = tf.reshape(tf.cast(features[key], tf.float32), (-1,))
+            if expects_baseline:
+                return (wf, ped), y, extra
+            return wf, y, extra
+        return pack
 
+    # --- One-time setup (shared by every fold) -------------------------------
     # Use the last TrainableThreshold layer when several thresholds exist -- but
     # only when it is the chain's decision point. In an OR chain several branches
     # each end in a threshold and an OrMerge combines them, so no single
@@ -1123,7 +1149,6 @@ class TriggerChain:
         pass
 
     trigger_chain_info = self.generate_chain_list()
-
     out_h5_path = self.generate_output_filename(folder, base_name=base_name)
 
     # Graceful Ctrl+C: finish current batch then discard partial stats.
@@ -1160,117 +1185,151 @@ class TriggerChain:
     if threshold_layer is not None:
         writer.f.attrs[PRE_THRESHOLD_COMPARISON_ATTR] = getattr(threshold_layer, "comparison", "gt")
     signal.signal(signal.SIGINT, _request_stop)
+
     trig_rate = None
-    gamma_total = 0
-    gamma_trig = 0
-    nsb_total = 0
-    nsb_trig = 0
+    all_stats = {}          # per-fold stats dict, keyed by fold name
     total_events = 0
 
-    # Live gamma-vs-NSB ROC AUC (Mann-Whitney) of the pre-threshold score: the
-    # same quantity the training loss optimizes and the stats report shows. We
-    # accumulate the per-class scores and recompute periodically (the exact
-    # rank-based AUC is cheap enough every few batches and once at the end).
-    gamma_score_chunks: list = []
-    nsb_score_chunks: list = []
-    roc_auc = float("nan")
-
     try:
-        for i_batch, (inp, y, extra) in enumerate(ds):
-            p = self.model(inp, training=False) 
-            p = tf.reshape(tf.cast(p, tf.float32), (-1,))
-            pre_threshold_score_np = None
-            trigger_ref_np = None
+        # Each fold is a full independent pass over the data, streamed into the
+        # same writer under its own fold index (all folds share one HDF5 file).
+        for fold_name, gamma_idx, nsb_idx, fold_cfg in fold_plan:
+            reindex = gamma_idx is not None or nsb_idx is not None
+            if reindex:
+                gi = tf.constant(
+                    np.arange(self.num_pixels) if gamma_idx is None else np.asarray(gamma_idx),
+                    dtype=tf.int32)
+                ni = tf.constant(
+                    np.arange(self.num_pixels) if nsb_idx is None else np.asarray(nsb_idx),
+                    dtype=tf.int32)
+                print(f"\n=== fold '{fold_name}' (reindex active, P={self.num_pixels}) ===")
+            else:
+                gi = ni = None
+                print(f"\n=== fold '{fold_name}' ===")
 
-            if threshold_layer is not None:
-                score_tensor = getattr(threshold_layer, "last_score", None)
-                if score_tensor is not None:
-                    score_tensor = self._collapse_scores_to_event_scores(score_tensor)
-                    pre_threshold_score_np = score_tensor.numpy().astype(np.float32)
-                    if tau is not None:
-                        if hasattr(threshold_layer, "hard_decision"):
-                            trigger_ref_np = threshold_layer.hard_decision(
-                                pre_threshold_score_np
-                            ).numpy().astype(np.uint8)
-                        else:
-                            trigger_ref_np = (pre_threshold_score_np > float(tau)).astype(np.uint8)
+            writer.begin_fold(fold_name, fold_cfg)
 
-            if trigger_ref_np is None:
-                trigger_ref_np = (p.numpy() > 0.5).astype(np.uint8)
+            print("Computing statistics with current model...")
+            stats_dataset = SimTelTFDataset(
+                gamma_files=self.simtel_path,
+                nsb_files=self.simtel_nsb_path,
+                opener_cls=AsyncFileOpenerProcess,
+                config=cfg
+            )
+            ds = (stats_dataset.dataset()
+                  .map(make_pack(reindex, gi, ni), num_parallel_calls=tf.data.AUTOTUNE)
+                  .prefetch(tf.data.AUTOTUNE))
 
-            # pull to numpy once/batch
-            y_np = y.numpy().astype(np.uint8)
-            
-            # Update statistics
-            batch_size = len(y_np)
-            total_events += batch_size
-            
-            n_pe_np = extra["n_pe"].numpy().astype(np.float32)
+            # Per-fold accumulators.
+            gamma_total = gamma_trig = nsb_total = nsb_trig = 0
+            gamma_eff = 0.0
+            nsb_rate_hz = 0.0
+            # Live gamma-vs-NSB ROC AUC (Mann-Whitney) of the pre-threshold score:
+            # the same quantity the training loss optimizes and the report shows.
+            gamma_score_chunks = []
+            nsb_score_chunks = []
+            roc_auc = float("nan")
 
-            # Gamma statistics (label=1)
-            gamma_mask = y_np == 1
-            gamma_total += np.sum(gamma_mask)
-            gamma_trig += np.sum(trigger_ref_np[gamma_mask] > 0)
+            for i_batch, (inp, y, extra) in enumerate(ds):
+                p = self.model(inp, training=False)
+                p = tf.reshape(tf.cast(p, tf.float32), (-1,))
+                pre_threshold_score_np = None
+                trigger_ref_np = None
 
-            # NSB statistics (label=0)
-            nsb_mask = y_np == 0
-            nsb_total += np.sum(nsb_mask)
-            nsb_trig += np.sum(trigger_ref_np[nsb_mask] > 0)
+                if threshold_layer is not None:
+                    score_tensor = getattr(threshold_layer, "last_score", None)
+                    if score_tensor is not None:
+                        score_tensor = self._collapse_scores_to_event_scores(score_tensor)
+                        pre_threshold_score_np = score_tensor.numpy().astype(np.float32)
+                        if tau is not None:
+                            if hasattr(threshold_layer, "hard_decision"):
+                                trigger_ref_np = threshold_layer.hard_decision(
+                                    pre_threshold_score_np
+                                ).numpy().astype(np.uint8)
+                            else:
+                                trigger_ref_np = (pre_threshold_score_np > float(tau)).astype(np.uint8)
 
-            # Accumulate per-class pre-threshold scores for the live ROC AUC.
-            if pre_threshold_score_np is not None:
-                gamma_score_chunks.append(pre_threshold_score_np[gamma_mask])
-                nsb_score_chunks.append(pre_threshold_score_np[nsb_mask])
+                if trigger_ref_np is None:
+                    trigger_ref_np = (p.numpy() > 0.5).astype(np.uint8)
 
-            cols = {
-                "label":     y_np,                                  # 1 gamma / 0 nsb
-                "event_id":  extra["event_id"].numpy().astype(np.int64),
-                "tel_id":    extra["tel_id"].numpy().astype(np.int32),
-                "n_pe":      n_pe_np,
-                "p_trig":    p.numpy().astype(np.float32),
-            }
-            for key in STATS_EVENT_FLOAT_KEYS:
-                cols[key] = extra[key].numpy().astype(np.float32)
-            if pre_threshold_score_np is not None:
-                cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np
-            writer.append(cols)
-            
-            # Calculate current statistics
-            gamma_eff = gamma_trig / gamma_total if gamma_total > 0 else 0.0
-            nsb_rate_hz = (nsb_trig / nsb_total / self.window_size) if nsb_total > 0 else 0.0
-            # Recompute the exact ROC AUC periodically (cheap, and once at the end).
-            if gamma_score_chunks and nsb_score_chunks and (i_batch % 20 == 0):
-                roc_auc = roc_auc_mann_whitney(
-                    np.concatenate(gamma_score_chunks), np.concatenate(nsb_score_chunks)
-                )
-            auc_txt = f"{roc_auc*100:.2f}%" if np.isfinite(roc_auc) else "NA"
+                # pull to numpy once/batch
+                y_np = y.numpy().astype(np.uint8)
+                total_events += len(y_np)
+                n_pe_np = extra["n_pe"].numpy().astype(np.float32)
 
-            # show stat ex :
-            # Processed batch 2, total events so far: 8192
-            # Current gamma trig/total: 387/480 => 8.062500e-01
-            # Current NSB rate (hard): 10/7642  NSB Rate => 6542.8 Hz
-            print(f"Processed batch {i_batch+1}, total events so far: {total_events}")
-            # show efficiency in from to to 100% with 2 decimals
-            print(f"Current gamma trig/total: {gamma_trig}/{gamma_total} => {gamma_eff*100:.2f}%  | AUC(gamma vs NSB) => {auc_txt}")
-            print(f"Current NSB rate (hard): {nsb_trig}/{nsb_total}  NSB Rate => {nsb_rate_hz:.1f} Hz")
+                # Gamma statistics (label=1)
+                gamma_mask = y_np == 1
+                gamma_total += np.sum(gamma_mask)
+                gamma_trig += np.sum(trigger_ref_np[gamma_mask] > 0)
 
-            if stop_flags["requested"]:
-                stop_flags["interrupted"] = True
-                print("Stopping after current batch as requested; partial stats will be discarded.")
+                # NSB statistics (label=0)
+                nsb_mask = y_np == 0
+                nsb_total += np.sum(nsb_mask)
+                nsb_trig += np.sum(trigger_ref_np[nsb_mask] > 0)
+
+                # Accumulate per-class pre-threshold scores for the live ROC AUC.
+                if pre_threshold_score_np is not None:
+                    gamma_score_chunks.append(pre_threshold_score_np[gamma_mask])
+                    nsb_score_chunks.append(pre_threshold_score_np[nsb_mask])
+
+                cols = {
+                    "label":     y_np,                                  # 1 gamma / 0 nsb
+                    "event_id":  extra["event_id"].numpy().astype(np.int64),
+                    "tel_id":    extra["tel_id"].numpy().astype(np.int32),
+                    "n_pe":      n_pe_np,
+                    "p_trig":    p.numpy().astype(np.float32),
+                }
+                for key in STATS_EVENT_FLOAT_KEYS:
+                    cols[key] = extra[key].numpy().astype(np.float32)
+                if pre_threshold_score_np is not None:
+                    cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np
+                writer.append(cols)
+
+                # Calculate current statistics
+                gamma_eff = gamma_trig / gamma_total if gamma_total > 0 else 0.0
+                nsb_rate_hz = (nsb_trig / nsb_total / self.window_size) if nsb_total > 0 else 0.0
+                # Recompute the exact ROC AUC periodically (cheap, and once at end).
+                if gamma_score_chunks and nsb_score_chunks and (i_batch % 20 == 0):
+                    roc_auc = roc_auc_mann_whitney(
+                        np.concatenate(gamma_score_chunks), np.concatenate(nsb_score_chunks)
+                    )
+                auc_txt = f"{roc_auc*100:.2f}%" if np.isfinite(roc_auc) else "NA"
+
+                print(f"[fold {fold_name}] batch {i_batch+1}, total events so far: {total_events}")
+                print(f"Current gamma trig/total: {gamma_trig}/{gamma_total} => {gamma_eff*100:.2f}%  | AUC(gamma vs NSB) => {auc_txt}")
+                print(f"Current NSB rate (hard): {nsb_trig}/{nsb_total}  NSB Rate => {nsb_rate_hz:.1f} Hz")
+
+                if stop_flags["requested"]:
+                    stop_flags["interrupted"] = True
+                    print("Stopping after current batch as requested; partial stats will be discarded.")
+                    break
+
+            if stop_flags["interrupted"]:
                 break
 
-        if not stop_flags["interrupted"]:
-            trig_rate = writer.close(window_sec=self.window_size)
-            # Exact ROC AUC over the full sample (matches the stats report).
+            # Exact ROC AUC over the full fold (matches the stats report).
             if gamma_score_chunks and nsb_score_chunks:
                 roc_auc = roc_auc_mann_whitney(
                     np.concatenate(gamma_score_chunks), np.concatenate(nsb_score_chunks)
                 )
-            print(f"Wrote {out_h5_path}")
-            print(f"NSB trigger rate = {trig_rate:.1f} Hz")
-            if np.isfinite(roc_auc):
-                print(f"Gamma vs NSB ROC AUC = {roc_auc*100:.2f}%")
-            # show the trigger chain info again at the end
+            all_stats[fold_name] = {
+                "gamma_total": int(gamma_total),
+                "gamma_trig": int(gamma_trig),
+                "gamma_efficiency": gamma_eff,
+                "roc_auc": roc_auc,
+                "nsb_total": int(nsb_total),
+                "nsb_trig": int(nsb_trig),
+                "nsb_rate_hz": nsb_rate_hz,
+            }
+            print(f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  "
+                  f"NSB rate={nsb_rate_hz:.1f} Hz  "
+                  f"AUC={roc_auc*100:.2f}% ---" if np.isfinite(roc_auc)
+                  else f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  NSB rate={nsb_rate_hz:.1f} Hz ---")
+
+        if not stop_flags["interrupted"]:
+            trig_rate = writer.close(window_sec=self.window_size)
+            print(f"Wrote {out_h5_path}  ({len(fold_plan)} fold(s))")
+            print(f"NSB trigger rate (fold 0) = {trig_rate:.1f} Hz")
             print(f"Trigger chain info: {self._format_chain_for_log(trigger_chain_info)}")
     except KeyboardInterrupt:
         stop_flags["interrupted"] = True
@@ -1295,19 +1354,14 @@ class TriggerChain:
 
     if stop_flags["interrupted"]:
         print("Statistics computation aborted.")
-    
-    # return final statistics as a dict
-    stats = {
-        "gamma_total": gamma_total,
-        "gamma_trig": gamma_trig,
-        "gamma_efficiency": gamma_eff,
-        "roc_auc": roc_auc,
-        "nsb_total": nsb_total,
-        "nsb_trig": nsb_trig,
-        "nsb_rate_hz": nsb_rate_hz,
-        "trigger_rate_hz": trig_rate
-    }
-    return stats
+
+    # Return per-fold stats. For a plain single-pass run (folds=None) return that
+    # one fold's dict directly, preserving the old return contract.
+    for st in all_stats.values():
+        st["trigger_rate_hz"] = trig_rate
+    if folds is None:
+        return all_stats.get("all", {})
+    return all_stats
 
   @staticmethod
   def _format_chain_for_log(chain, weight_decimals=4, float_decimals=6):

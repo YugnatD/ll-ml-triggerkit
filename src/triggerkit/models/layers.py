@@ -25,17 +25,49 @@ class ScatterToGrid(keras.layers.Layer):
     constant ``(P, H*W)`` matmul (one-hot per pixel), exactly the trick the hex
     CNN sandbox used, kept inside the graph so adapter + CNN train/save as one.
 
-    Build from a fitted grid with :meth:`from_geometry`.
+    Two ways to build it:
+
+    * ``ScatterToGrid(time_window=32)`` -- *unbound*: you only give the time knobs
+      and the camera geometry is bound later (``SequentialBody`` / ``build_chain``
+      call :meth:`bind_geometry` with ``chain.geom`` before applying it). This is
+      the declarative form used in a layer list.
+    * :meth:`from_geometry` or ``ScatterToGrid(matrix, H, W)`` -- *bound* up front.
     """
 
-    def __init__(self, scatter_matrix, H, W, *, time_skip=0, time_window=None, **kwargs):
+    def __init__(self, scatter_matrix=None, H=None, W=None, *, time_skip=0, time_window=None, **kwargs):
         super().__init__(**kwargs)
-        self.scatter_matrix = np.asarray(scatter_matrix, dtype=np.float32)
-        self.H = int(H)
-        self.W = int(W)
         self.time_skip = int(time_skip)
         self.time_window = None if time_window is None else int(time_window)
-        self._M = tf.constant(self.scatter_matrix)  # (P, H*W)
+        if scatter_matrix is None:
+            # Unbound: geometry supplied later via bind_geometry().
+            self.scatter_matrix = None
+            self.H = None if H is None else int(H)
+            self.W = None if W is None else int(W)
+            self._M = None
+        else:
+            self.scatter_matrix = np.asarray(scatter_matrix, dtype=np.float32)
+            self.H = int(H)
+            self.W = int(W)
+            self._M = tf.constant(self.scatter_matrix)  # (P, H*W)
+
+    @property
+    def bound(self):
+        return self._M is not None
+
+    def bind_geometry(self, geometry):
+        """Fit the grid from a camera geometry and fill the scatter matrix in place.
+
+        No-op if already bound. Called by the body builder before the layer is
+        applied, so an unbound ``ScatterToGrid(time_window=...)`` in a layer list
+        picks up ``chain.geom`` automatically.
+        """
+        if self.bound:
+            return self
+        grid = GridTransform(geometry)
+        self.scatter_matrix = np.asarray(grid.scatter_matrix(), dtype=np.float32)
+        self.H, self.W = int(grid.H), int(grid.W)
+        self._M = tf.constant(self.scatter_matrix)
+        return self
 
     @classmethod
     def from_geometry(cls, geometry, *, time_skip=0, time_window=None, **kwargs):
@@ -47,6 +79,11 @@ class ScatterToGrid(keras.layers.Layer):
         )
 
     def call(self, x):
+        if self._M is None:
+            raise RuntimeError(
+                "ScatterToGrid is unbound: no camera geometry. Put it in a "
+                "SequentialBody / build_chain (which calls bind_geometry with "
+                "chain.geom), or construct it via ScatterToGrid.from_geometry().")
         x = tf.cast(x, tf.float32)                       # (B, P, S)
         t0 = self.time_skip
         t1 = None if self.time_window is None else t0 + self.time_window
@@ -64,7 +101,7 @@ class ScatterToGrid(keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update({
-            "scatter_matrix": self.scatter_matrix.tolist(),
+            "scatter_matrix": None if self.scatter_matrix is None else self.scatter_matrix.tolist(),
             "H": self.H, "W": self.W,
             "time_skip": self.time_skip, "time_window": self.time_window,
         })

@@ -234,11 +234,19 @@ class StatPlotter:
         float_atol: float = 1e-6,
         float_rtol: float = 1e-5,
         h5_chunk_rows: int = 200_000,
+        fold: Optional[str] = None,
     ):
         # Accept either a single folder string or a list of folders.
         folders = [stat_folder] if isinstance(stat_folder, str) else list(stat_folder)
         self.stat_folder = folders[0]  # kept for backwards-compat (e.g. report output dir)
         self.base_reference_config = base_reference_config
+
+        # Optional cross-validation fold selection. A stats file may hold several
+        # folds (a `fold` column in /events + a /folds table). fold=None reads
+        # every event = the aggregate over all folds (default, unchanged). Setting
+        # fold="rot120_rolled" restricts every event read to that single fold, so
+        # the same plots can be drawn per fold to inspect leakage in detail.
+        self._fold_filter = fold
 
         self.float_atol = float_atol
         self.float_rtol = float_rtol
@@ -743,6 +751,26 @@ class StatPlotter:
             return grp[PRE_THRESHOLD_SCORE_DATASET]
         return None
 
+    def _fold_row_mask(self, grp: "h5py.Group", sl: slice) -> Optional[np.ndarray]:
+        """Boolean keep-mask over the sliced rows for the selected fold.
+
+        Returns None when no fold filtering applies (fold=None, or the file has no
+        `fold` column -- e.g. a legacy single-fold file). Raises if the requested
+        fold name is not present in the file's /folds table."""
+        if self._fold_filter is None or grp is None or "fold" not in grp:
+            return None
+        f = grp.file
+        names = None
+        if "folds" in f and "name" in f["folds"]:
+            names = [x.decode() if isinstance(x, bytes) else str(x)
+                     for x in f["folds"]["name"][()]]
+        if not names or self._fold_filter not in names:
+            raise KeyError(
+                f"fold {self._fold_filter!r} not found in {f.filename} "
+                f"(available: {names})")
+        idx = names.index(self._fold_filter)
+        return np.asarray(grp["fold"][sl]).reshape(-1) == idx
+
     def _label_mask(self, label_chunk: np.ndarray, kind: str) -> np.ndarray:
         # label is typically 0/1 integers, but we handle strings too
         if label_chunk.dtype.kind in ("S", "U", "O"):
@@ -784,9 +812,15 @@ class StatPlotter:
                 sl = slice(start, end)
 
                 x = np.asarray(ds[sl]).reshape(-1)
+                keep = self._fold_row_mask(grp, sl)
                 if label_ds is not None:
                     lab = np.asarray(label_ds[sl]).reshape(-1)
-                    x = x[self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")]
+                    m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
+                    if keep is not None:
+                        m = m & keep
+                    x = x[m]
+                elif keep is not None:
+                    x = x[keep]
 
                 if x.size == 0:
                     continue
@@ -1071,19 +1105,28 @@ class StatPlotter:
                 x = x.reshape(-1)
                 score_raw = None
 
+                keep = self._fold_row_mask(grp, sl)
                 if label_ds is not None:
                     lab = np.asarray(label_ds[sl]).reshape(-1)
                     m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
+                    if keep is not None:
+                        m = m & keep
                     x = x[m]
                     if score_ds is not None and resolved_score_threshold is not None:
                         score_raw = np.asarray(score_ds[sl]).reshape(-1)[m]
                     else:
                         trig_raw = np.asarray(trig_ds[sl]).reshape(-1)[m]
                 else:
+                    if keep is not None:
+                        x = x[keep]
                     if score_ds is not None and resolved_score_threshold is not None:
                         score_raw = np.asarray(score_ds[sl]).reshape(-1)
+                        if keep is not None:
+                            score_raw = score_raw[keep]
                     else:
                         trig_raw = np.asarray(trig_ds[sl]).reshape(-1)
+                        if keep is not None:
+                            trig_raw = trig_raw[keep]
 
                 if score_raw is not None:
                     trig = self._score_trigger_mask(
@@ -1156,11 +1199,17 @@ class StatPlotter:
                 x = np.asarray(x_ds[sl]).reshape(-1)
                 y = np.asarray(y_ds[sl]).reshape(-1)
 
+                keep = self._fold_row_mask(grp, sl)
                 if label_ds is not None:
                     lab = np.asarray(label_ds[sl]).reshape(-1)
                     m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
+                    if keep is not None:
+                        m = m & keep
                     x = x[m]
                     y = y[m]
+                elif keep is not None:
+                    x = x[keep]
+                    y = y[keep]
 
                 # drop NaNs/infs
                 mfinite = np.isfinite(x) & np.isfinite(y)
@@ -1773,6 +1822,9 @@ class StatPlotter:
                 mask = None
                 if label_ds is not None:
                     mask = self._label_mask(np.asarray(label_ds[sl]).reshape(-1), kind=kind)
+                keep = self._fold_row_mask(grp, sl)
+                if keep is not None:
+                    mask = keep if mask is None else (mask & keep)
                 for nm in names:
                     a = np.asarray(grp[nm][sl]).reshape(-1)
                     out[nm].append(a[mask] if mask is not None else a)

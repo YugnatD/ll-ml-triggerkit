@@ -1,15 +1,15 @@
-"""Train the hex 3D-CNN trigger with a pairwise-AUC loss -- on triggerkit.
+"""Train a hex 3D-CNN trigger with a pairwise-AUC loss -- on triggerkit.
 
-Port of the sandbox's ``train_hex_cnn.py`` onto the packaged API. The recipe is
-identical to ``examples/train_tdscan.py`` -- pairwise-AUC multi-start training,
-best restart kept, tau re-calibrated -- only the body differs: instead of a
-TDSCAN filter it is the ``hex3d_hybrid`` backbone (scatter-to-grid adapter +
-Conv3D temporal blocks + hexagdly spatial blocks + Dense classifier + threshold).
+The CNN is NOT hardcoded: you declare it as a plain ``SequentialBody`` layer list
+(Keras layers + hexagdly convs + the ``ScatterToGrid`` / ``TimeMean`` /
+``GlobalHexMean`` adapters), and ``build_chain(ds, body, filters=N)`` builds the
+chain, appends a ``Dense(filters)`` classifier head + threshold, and returns
+``(chain, head, thr)``. Swap any layer freely -- add a MaxPool2D, change the
+channel counts, whatever.
 
-One important difference from TDSCAN restarts: the backbone is SHARED across the
-``N_FILTERS`` restarts; only the final Dense ``classifier`` has ``N_FILTERS``
-independent output columns. Collapsing therefore keeps the (single) trained
-backbone and just the winning classifier column.
+The training recipe mirrors ``examples/train_tdscan.py``: pairwise-AUC multi-start
+training (``filters`` parallel classifier columns over one shared backbone), keep
+the best column, re-calibrate tau.
 
 Requires the ``[hexcnn]`` extra (``pip install '.[hexcnn]'`` -- pulls in
 keras_hexagdly).
@@ -24,42 +24,55 @@ import sys
 
 import numpy as np
 import tensorflow as tf
+import keras_hexagdly as hgly
 
 from triggerkit import training
-from triggerkit.TriggerChain import TriggerChain
 from triggerkit.data import TriggerDataset
-from triggerkit.models import get_body
+from triggerkit.models import (
+    GlobalHexMean,
+    ScatterToGrid,
+    SequentialBody,
+    TimeMean,
+    build_chain,
+)
 
-# --- Config (mirrors train_hex_cnn.py) ---------------------------------------
+# --- Config ------------------------------------------------------------------
 PERCENT_VALIDATION = 0.2
 N_FILTERS = 4             # parallel classifier-head restarts (shared backbone)
 BATCH_SIZE = 16
 EPOCHS = 100
 TARGET_RATE_HZ = 50_000
 SEED = 1337
-
 TIME_SKIP = 0
 TIME_WINDOW = 32
 
-# Backbone (weight-carrying) layer names in the hex3d_hybrid body; the ReLU /
-# scatter / pool layers have no weights and are rebuilt fresh on collapse.
+# Backbone (weight-carrying) layer names, used to transplant the shared trained
+# backbone into the collapsed filters=1 chain. The ReLU / adapter layers have no
+# weights and are rebuilt fresh.
 BACKBONE_LAYER_NAMES = ("temporal_0", "temporal_2", "spatial_0", "spatial_2")
+
+
+def make_body():
+    """A fresh hex 3D-CNN feature body. Declare the CNN however you like here."""
+    return SequentialBody([
+        ScatterToGrid(time_skip=TIME_SKIP, time_window=TIME_WINDOW),   # (B,T,H,W,1)
+        tf.keras.layers.Conv3D(8, (5, 1, 1), strides=(2, 1, 1), padding="same", name="temporal_0"),
+        tf.keras.layers.ReLU(),
+        tf.keras.layers.Conv3D(8, (3, 1, 1), strides=(2, 1, 1), padding="same", name="temporal_2"),
+        tf.keras.layers.ReLU(),
+        TimeMean(),                                                    # (B,H,W,C)
+        hgly.Conv2d(8, 16, kernel_size=2, stride=2, bias=True, share_neighbors=False, name="spatial_0"),
+        tf.keras.layers.ReLU(),
+        hgly.Conv2d(16, 32, kernel_size=2, stride=2, bias=True, share_neighbors=False, name="spatial_2"),
+        tf.keras.layers.ReLU(),
+        GlobalHexMean(),                                               # (B,C)
+    ])
 
 
 def _train_inputs(chain):
     if chain.camera_name == "DigiCam_R0Alpha":
         return chain.input_layer
     return [chain.input_layer, chain.input_baseline]
-
-
-def _build_body(chain, filters):
-    """Build the hex3d_hybrid body onto ``chain``; return its handles dict."""
-    return get_body(
-        "hex3d_hybrid",
-        filters=filters,
-        time_skip=TIME_SKIP,
-        time_window=TIME_WINDOW,
-    ).build(chain)
 
 
 def main():
@@ -75,12 +88,22 @@ def main():
     print(f"Global RNG seed set to {SEED}.")
     print(f"Found {len(gamma_files)} gamma files, {len(nsb_files)} NSB files.")
 
-    # --- The training chain: N_FILTERS classifier heads (collapsed to 1 below).
-    chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    handles = _build_body(chain, N_FILTERS)
-    classifier = handles["classifier"]
-    threshold_layer = next(h for h in handles.values() if hasattr(h, "tau"))
-    score_tensor = classifier.output  # pre-threshold score, shape (B, N_FILTERS)
+    ds = TriggerDataset(
+        gamma_files, nsb_files,
+        batch_size=BATCH_SIZE,
+        percent_validation=PERCENT_VALIDATION,
+        tel_id_only=1,
+        max_gamma_samples_train=10_000,
+        max_gamma_samples_val=10_000,
+        max_nsb_samples_train=10_000,
+        max_nsb_samples_val=10_000,
+        load_ram=True,
+        seed=SEED,
+    )
+
+    # --- Chain + Dense(N_FILTERS) head + threshold, all in one call ----------
+    chain, head, threshold_layer = build_chain(ds, make_body(), filters=N_FILTERS)
+    score_tensor = head.output  # pre-threshold score, shape (B, N_FILTERS)
 
     # --- Calibrate tau / temp on the best-filter envelope --------------------
     calib_score = tf.keras.layers.Lambda(
@@ -90,8 +113,6 @@ def main():
         chain, calib_score, gamma_files)
     print(f"Calibration: gamma mean={float(scores_g.mean()):.2f} "
           f"=> init_tau={init_tau:.2f}, temp={temp:.4g}")
-    print(f"  gamma score range=[{scores_g.min():.2f}, {scores_g.max():.2f}] (n={scores_g.size})")
-    print(f"  nsb   score range=[{scores_n.min():.2f}, {scores_n.max():.2f}] (n={scores_n.size})")
 
     threshold_layer.tau.assign(init_tau)
     threshold_layer.set_trainable(False)
@@ -118,25 +139,8 @@ def main():
             min_lr=1e-5, verbose=1),
         training.PerFilterAUCLogger(N_FILTERS),
     ]
-
-    dataset = TriggerDataset(
-        gamma_files, nsb_files,
-        batch_size=BATCH_SIZE,
-        percent_validation=PERCENT_VALIDATION,
-        tel_id_only=1,
-        max_gamma_samples_train=10_000,
-        max_gamma_samples_val=10_000,
-        max_nsb_samples_train=10_000,
-        max_nsb_samples_val=10_000,
-        load_ram=True,
-        seed=SEED,
-    )
     history = chain.train_chain(
-        epochs=EPOCHS,
-        callbacks=train_callbacks,
-        verbose=0,
-        dataset=dataset,
-    )
+        epochs=EPOCHS, callbacks=train_callbacks, verbose=0, dataset=ds)
 
     # --- Pick the winning classifier column ----------------------------------
     hist = history.history if history is not None else {}
@@ -145,27 +149,21 @@ def main():
     best_f, sel_info = training.select_best_filter(
         chain, score_tensor, select_files, target_rate_hz=TARGET_RATE_HZ)
     eff = sel_info["efficiency"]
-    print(f"Held-out gamma efficiency @ {TARGET_RATE_HZ} Hz "
-          f"(n_gamma={sel_info['n_gamma']}, n_nsb={sel_info['n_nsb']}): "
-          + ", ".join(f"f{k}={eff[k]:.4f}" for k in range(N_FILTERS)))
     print(f"Keeping filter {best_f} (efficiency={eff[best_f]:.4f}); "
           "collapsing to filters=1.")
 
     # Snapshot the shared trained backbone + the winning classifier column.
-    backbone_weights = {n: handles[n].get_weights() for n in BACKBONE_LAYER_NAMES}
-    clf_kernel, clf_bias = classifier.get_weights()
+    backbone_weights = {n: chain.model.get_layer(n).get_weights() for n in BACKBONE_LAYER_NAMES}
+    clf_kernel, clf_bias = head.get_weights()
     best_kernel = clf_kernel[:, best_f:best_f + 1]
     best_bias = clf_bias[best_f:best_f + 1]
 
     # --- Rebuild the filters=1 chain and transplant the trained weights ------
-    chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    handles = _build_body(chain, 1)
-    classifier = handles["classifier"]
-    threshold_layer = next(h for h in handles.values() if hasattr(h, "tau"))
+    chain, head, threshold_layer = build_chain(ds, make_body(), filters=1)
     for n in BACKBONE_LAYER_NAMES:
-        handles[n].set_weights(backbone_weights[n])
-    classifier.set_weights([best_kernel, best_bias])
-    score_tensor = classifier.output  # now shape (B, 1)
+        chain.model.get_layer(n).set_weights(backbone_weights[n])
+    head.set_weights([best_kernel, best_bias])
+    score_tensor = head.output  # now shape (B, 1)
 
     # --- Post-training tau re-calibration ------------------------------------
     post_tau, _, post_g, _post_n = training.calibrate_tau(
@@ -175,7 +173,13 @@ def main():
           f"new tau={post_tau:.2f}")
 
     # --- Save the collapsed filters=1 chain ----------------------------------
-    chain.model = tf.keras.Model(inputs=_train_inputs(chain), outputs=score_tensor)
+    # Save the THRESHOLD-terminated model (tau baked in above), not the raw
+    # score: stats reopens it with chain.compile_chain(model_path=...), which
+    # needs the TrainableThreshold layer inside the graph (find_threshold /
+    # compute_statistics locate it and read its pre-threshold input). Every
+    # custom layer is register_keras_serializable, so load_model round-trips
+    # with no custom_objects and no need to redefine the architecture.
+    chain.model = tf.keras.Model(inputs=_train_inputs(chain), outputs=threshold_layer.output)
     model_path = chain.generate_output_filename(
         folder="trained_models", base_name="hexcnn_trigger", suffix="model.keras")
     chain.model.save(model_path)

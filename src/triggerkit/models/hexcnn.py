@@ -1,26 +1,23 @@
-"""``Hex3DHybridBody``: Jakub's Hex3DHybridCNN trigger backbone as a body.
+"""Convenience preset: Jakub's Hex3DHybridCNN feature backbone as a layer list.
 
 A layer-for-layer port of ``train_hex_cnn.build_adapter`` +
-``build_hex3d_backbone`` + classifier head, expressed on top of
-:class:`~triggerkit.models.sequential.SequentialBody`:
+``build_hex3d_backbone``, expressed as a
+:class:`~triggerkit.models.sequential.SequentialBody` layer list:
 
     scatter_to_grid
     -> [pad+Conv3D(5,1,1) s2 + ReLU] x1
     -> [pad+Conv3D(3,1,1) s2 + ReLU] x1
     -> time_mean
     -> [hgly.Conv2d(k2,s2) + ReLU] per spatial channel count
-    -> global_hex_mean
-    -> Dense(filters)  (classifier)
-    -> threshold
+    -> global_hex_mean          (feature vector; head added by build_chain)
 
-``keras_hexagdly`` is imported lazily (only when this body is built), so the
-package stays importable without the optional ``[hexcnn]`` extra. This body is a
-convenience preset; for a different CNN just write your own ``SequentialBody``.
+``keras_hexagdly`` is imported lazily (only when the list is built), so the
+package stays importable without the optional ``[hexcnn]`` extra. This is just a
+preset; for a different CNN write your own ``SequentialBody`` layer list.
 """
 
 from tensorflow import keras
 
-from triggerkit.models.base import register_body
 from triggerkit.models.sequential import SequentialBody
 
 
@@ -37,16 +34,18 @@ def _pad_temporal(pad):
 
 def hex3d_hybrid_layers(
     *,
-    filters=1,
     time_skip=0,
     time_window=32,
     temporal_channels=8,
     spatial_channels=(16, 32),
-    init_tau=0.0,
-    temp=10.0,
-    binary_output=True,
 ):
-    """Return the SequentialBody layer list for the Hex3DHybrid backbone.
+    """Return the SequentialBody *feature* layer list for the Hex3DHybrid backbone.
+
+    The list ends at ``global_hex_mean`` (a ``(B, C)`` feature vector); the
+    ``Dense`` classifier head + threshold are added by :func:`build_chain`. So
+    this is a convenience preset -- for a different CNN just write your own list::
+
+        chain, head, thr = build_chain(ds, SequentialBody(hex3d_hybrid_layers()), filters=4)
 
     ``keras_hexagdly`` must be installed (``pip install '.[hexcnn]'``).
     """
@@ -78,17 +77,10 @@ def hex3d_hybrid_layers(
         layers.append(keras.layers.ReLU())
         prev_c = out_c
 
-    layers += [
-        "global_hex_mean",
-        keras.layers.Dense(filters, name="classifier"),
-        ("threshold", {"init_tau": init_tau, "temp": temp, "binary_output": binary_output}),
-    ]
+    layers.append("global_hex_mean")
     return layers
 
 
-@register_body("hex3d_hybrid")
-class Hex3DHybridBody(SequentialBody):
-    """Preset :class:`SequentialBody` for Jakub's Hex3DHybridCNN. See module docstring."""
-
-    def __init__(self, **kwargs):
-        super().__init__(hex3d_hybrid_layers(**kwargs))
+def hex3d_hybrid_body(**kwargs):
+    """Convenience: ``SequentialBody(hex3d_hybrid_layers(**kwargs))`` (feature body)."""
+    return SequentialBody(hex3d_hybrid_layers(**kwargs))

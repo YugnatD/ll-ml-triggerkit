@@ -5,7 +5,7 @@ Nothing about the training recipe changed; only the imports did:
 
     sandbox                              triggerkit
     -------------------------------------------------------------------
-    tdscan_chain.build_chain(...)     -> get_body("tdscan", ...).build(chain)
+    tdscan_chain.build_chain(...)     -> TDSCANBody(...).build(chain)
     train_utils.<fn>                  -> triggerkit.training.<fn>
     (inline dataset kwargs)           -> TriggerDataset(...) + train_chain(dataset=)
     dataset_config.get_*_files        -> gamma/NSB file lists you pass in
@@ -39,7 +39,7 @@ import tensorflow as tf
 from triggerkit import training
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.data import TriggerDataset
-from triggerkit.models import get_body
+from triggerkit.models import TDSCANBody, generate_lin_space_edges
 
 # --- Config (mirrors the sandbox script) -------------------------------------
 PERCENT_VALIDATION = 0.2
@@ -49,15 +49,67 @@ EPOCHS = 400
 TARGET_RATE_HZ = 50_000   # operating point the held-out filter selection uses
 SEED = 1337
 
-# Score-quantizer edge placement, as in tdscan_chain.py.
-EDGES_RANGE = (16, 128)
-EDGES_NUM_BIT = 4
+# Score-quantizer front-end (as in tdscan_chain.py): bucket each pixel's input
+# into 2**EDGES_NUM_BIT - 1 integer levels spaced over EDGES_RANGE=(lo, hi) before
+# TDSCAN (mimics the FPGA ADC quantization of the waveform). To DISABLE it, set
+# EDGES_FUNC = None (like every other None-able knob); it's also skipped when
+# EDGES_NUM_BIT == 0 or hi <= lo. Don't set EDGES_RANGE = None -- that would crash
+# on edges_range[1].
+EDGES_RANGE = (16, 128)   # (lo, hi) span the quantizer edges cover
+EDGES_NUM_BIT = 4         # bit depth -> 2**4 - 1 = 15 levels
+EDGES_FUNC = generate_lin_space_edges   # edge-placement fn (from triggerkit.models); None disables the quantizer
+
+# Inner accumulator quantization = quantization-aware training of the TDSCAN
+# filter's FPGA fixed-point path. Each qspec is "<U|S>Q<int_bits>.<frac_bits>".
+#   input / ring_weights                                 -> waveform / weights
+#   convolution_accumulator / convolution_rescale_shift  -> spatial (per-ring) sum
+#   temporal_accumulator     / temporal_rescale_shift    -> time sum
+# quantize_step alone only quantizes at inference; FAKE_QUANT_ACCUMULATORS=True
+# makes the training (straight-through) forward pass fake-quantize the two inner
+# accumulators too, so training sees the deployed fixed-point arithmetic.
+# Set QUANTIZE_STEP = None (and FAKE_QUANT_ACCUMULATORS = False) to train in float.
+QUANTIZE_STEP = {
+    "input": "UQ4.0",
+    "ring_weights": "UQ3.1",
+    "convolution_accumulator": "SQ9.0",
+    "convolution_rescale_shift": 0,
+    "temporal_accumulator": "SQ9.0",
+    "temporal_rescale_shift": 0,
+}
+FAKE_QUANT_ACCUMULATORS = True  # True: the training (straight-through) forward pass also fake-quantizes the conv + temporal accumulators, so training "sees" the deployed fixed-point (quantization-aware training). False: float accumulators while training. Only matters if QUANTIZE_STEP is set; inference always quantizes regardless.
+
+# TDSCAN accumulator overflow / rounding + post-accumulation right-shift.
+OVERFLOW_MODE = "AP_SAT"        # saturate on overflow
+QUANTIZATION_MODE = "AP_TRN"    # truncate on rounding
+RESCALE_SHIFT = 0               # right-shift (÷2**n) the accumulator after summation to rescale back into range; 0 = no rescale
+
+# Optional front-/back-end stages (all off by default -> the deployed chain).
+SUBTRACT_VALUE = None           # scalar subtracted before TDSCAN (FPGA pedestal/"shift" subtraction); None = no subtract stage
+SUBTRACT_QUANTIZE_STEP = None   # fixed-point for the subtract stage, keys input/shift_value/output, e.g. {"input": "UQ8.0", "shift_value": "UQ8.0", "output": "SQ9.0"}
+SUBTRACT_OVERFLOW_MODE = "AP_WRAP"      # subtract-stage overflow behaviour
+SUBTRACT_QUANTIZATION_MODE = "AP_TRN"   # subtract-stage rounding behaviour
+DIGITAL_SUM_MODE = None         # digital-sum stage after TDSCAN summing pixel scores over a patch, e.g. "patch7" (7-pixel patch trigger); None = off
+FADC = False                    # shared FADC baseline-subtraction front-end before TDSCAN; False = off
 
 
-def generate_lin_space_edges(start, stop, num_bit):
-    """Linearly spaced integer edges for the score quantizer (2**num_bit - 1)."""
-    num_edges = 2 ** num_bit - 1
-    return np.linspace(start, stop, num=num_edges).astype(int).tolist()
+def _tdscan_hw_kwargs():
+    """The shared HW / stage knobs, identical for the N_FILTERS and filters=1 bodies."""
+    return dict(
+        edges_range=EDGES_RANGE,
+        edges_num_bit=EDGES_NUM_BIT,
+        edges_func=EDGES_FUNC,
+        quantize_step=QUANTIZE_STEP,
+        fake_quant_accumulators=FAKE_QUANT_ACCUMULATORS,
+        overflow_mode=OVERFLOW_MODE,
+        quantization_mode=QUANTIZATION_MODE,
+        rescale_shift=RESCALE_SHIFT,
+        subtract_value=SUBTRACT_VALUE,
+        subtract_quantize_step=SUBTRACT_QUANTIZE_STEP,
+        subtract_overflow_mode=SUBTRACT_OVERFLOW_MODE,
+        subtract_quantization_mode=SUBTRACT_QUANTIZATION_MODE,
+        digital_sum_mode=DIGITAL_SUM_MODE,
+        fadc=FADC,
+    )
 
 
 def _train_inputs(chain):
@@ -81,17 +133,11 @@ def main():
     print(f"Found {len(gamma_files)} training gamma files, {len(nsb_files)} NSB files.")
 
     # --- The training chain: N_FILTERS parallel restarts (collapsed to 1 below).
-    # get_body(...).build(chain) replaces tdscan_chain.build_chain: the TDSCAN body
+    # TDSCANBody(...).build(chain) replaces tdscan_chain.build_chain: the TDSCAN body
     # appends the exact same stages ([score_quantizer] -> tdscan -> max-pool ->
     # threshold) and hands back the tdscan/threshold layer handles.
     chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    body = get_body(
-        "tdscan",
-        filters=N_FILTERS,
-        edges_range=EDGES_RANGE,
-        edges_num_bit=EDGES_NUM_BIT,
-        edges_func=generate_lin_space_edges,
-    )
+    body = TDSCANBody(filters=N_FILTERS, **_tdscan_hw_kwargs())
     handles = body.build(chain)
     tdscan_layer, threshold_layer = handles["tdscan"], handles["threshold"]
     score_tensor = threshold_layer.input  # pre-threshold score, shape (B, N_FILTERS)
@@ -188,13 +234,7 @@ def main():
 
     # Rebuild the normal filters=1 chain and copy the winning weights in.
     chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    handles = get_body(
-        "tdscan",
-        filters=1,
-        edges_range=EDGES_RANGE,
-        edges_num_bit=EDGES_NUM_BIT,
-        edges_func=generate_lin_space_edges,
-    ).build(chain)
+    handles = TDSCANBody(filters=1, **_tdscan_hw_kwargs()).build(chain)
     tdscan_layer, threshold_layer = handles["tdscan"], handles["threshold"]
     score_tensor = threshold_layer.input  # now shape (B, 1)
     if shared:

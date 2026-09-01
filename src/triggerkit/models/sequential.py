@@ -36,14 +36,13 @@ Named layers (``layer.name``) and the returned handles are collected into the
 
 from tensorflow import keras
 
-from triggerkit.models.base import TriggerBody, register_body
+from triggerkit.models.base import TriggerBody
 from triggerkit.models.layers import GlobalHexMean, ScatterToGrid, TimeMean
 
 # Adapter stage names handled here (everything else falls through to add_stage).
 _ADAPTERS = ("scatter_to_grid", "time_mean", "global_hex_mean")
 
 
-@register_body("sequential")
 class SequentialBody(TriggerBody):
     """A trigger-chain body declared as a list of layers/stages. See module docstring.
 
@@ -83,6 +82,10 @@ class SequentialBody(TriggerBody):
             kwargs = spec[1] if len(spec) > 1 and spec[1] is not None else {}
             return self._apply_named(chain, name, dict(kwargs))
         if isinstance(spec, keras.layers.Layer):
+            # An unbound ScatterToGrid(time_window=...) picks up the camera
+            # geometry here, so it can be declared without a scatter matrix.
+            if isinstance(spec, ScatterToGrid) and not spec.bound:
+                spec.bind_geometry(chain.geom)
             chain.last_layer = spec(chain.last_layer)
             return spec
         if callable(spec):
