@@ -27,44 +27,40 @@ from triggerkit.Statistics.StatPlotter import StatPlotter
 
 TARGET_RATE_HZ = 50_000.0
 
-# Folders holding the .h5 stat files (what the stat scripts wrote to).
-STAT_FOLDERS = [
-    "simu_sst1m_tel2_tdscan",
-    "simu_sst1m_tel2_hexcnn",
-]
+# Folders holding the .h5 stat files. These are the outputs of the cross-
+# validation run (stats_patch7.py + stats_tdscan.py, 10 folds each) copied into
+# examples/results/. Point this at your own OUTPUT_FOLDER(s) if you re-run.
+STAT_FOLDERS = ["results"]
 OUTPUT_DIR = "trigger_report"
 
-# --- Example configs ---------------------------------------------------------
-# The classic 7-pixel analog-sum baseline (digital_sum patch7 + threshold).
+# --- Configs (match the actual cross-validation runs in results/) ------------
+# These mirror the two .h5 files in examples/results/. The threshold values are
+# the frozen tau each stat script printed (tuned once to ~50 kHz NSB).
+#
+# The real patch7 telescope trigger (digital_sum patch7 + threshold, no TDSCAN).
 CONFIG_PATCH7 = [
     ("digital_sum", {"mode": "patch7"}),
-    ("threshold", {"threshold": 242.0, "binary": True, "comparison": "gt"}),
+    ("threshold", {"threshold": 241.99998474121094, "binary": True, "comparison": "gt"}),
 ]
 
-# A trained TDSCAN chain (score_quantizer + tdscan + threshold). Replace the
-# ring_weights / id / threshold with the values your stats_tdscan.py run printed.
+# The deployed TDSCAN chain: eps_xy=1, eps_t=2 (10 shared ring weights), float
+# (no score_quantizer). StatPlotter ignores id / weights when matching and
+# compares weights with np.allclose, so the flat ring_weights below match the
+# nested stored weights; the threshold is what stats_tdscan.py printed.
 CONFIG_TDSCAN = [
-    ("score_quantizer", {"edges": [16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]}),
     ("tdscan", {
-        "eps_xy": 1, "eps_t": 1, "filters": 1, "share_neighbors": True,
+        "eps_xy": 1, "eps_t": 2, "filters": 1, "share_neighbors": True,
         "ring_weights": [0.5, 0.0625, -0.5, -0.0039, -1.0, -0.25, 1.0, 0.125, 0.5, 0.25],
     }),
-    ("threshold", {"threshold": 66.5, "binary": True, "comparison": "gt"}),
-]
-
-# The hex 3D-CNN chain. Its stored chain is just the threshold-terminated CNN;
-# StatPlotter matches on the recorded chain json, so keep this minimal and let
-# the file's own metadata carry the details.
-CONFIG_HEXCNN = [
-    ("threshold", {"threshold": 9.2, "binary": True, "comparison": "gt"}),
+    ("threshold", {"threshold": 97.9535903930664, "binary": True, "comparison": "gt"}),
 ]
 
 # Base reference for ratio plots (must match one of the .h5 files).
 BASE_CONFIG = CONFIG_PATCH7
 
 # The configs to plot, and 1:1 legend labels.
-PLOT_CONFIGS = [CONFIG_PATCH7, CONFIG_TDSCAN, CONFIG_HEXCNN]
-LEGENDS = ["PATCH7", "TDSCAN ml xy1,t1", "hex 3D-CNN"]
+PLOT_CONFIGS = [CONFIG_PATCH7, CONFIG_TDSCAN]
+LEGENDS = ["PATCH7", "TDSCAN ml xy1,t2"]
 
 
 def main():
@@ -79,6 +75,8 @@ def main():
     for config in PLOT_CONFIGS:
         plotter.add_plot(config)
 
+    # generateReport embeds the cross-validation (per-fold leakage) graph as its
+    # own section whenever a config carries a /folds group -- no separate file.
     report_path = plotter.generateReport(
         configs=PLOT_CONFIGS,
         output_dir=OUTPUT_DIR,

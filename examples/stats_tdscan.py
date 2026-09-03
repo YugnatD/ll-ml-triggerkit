@@ -29,12 +29,12 @@ from triggerkit.augment import make_rotation_folds
 from triggerkit.models import TDSCANBody, generate_lin_space_edges
 
 # --- Config (mirrors evaluate_perf_tdscan.py) --------------------------------
-BASE_NAME = "simu"
+BASE_NAME = "simu_cross"
 TARGET_RATE_HZ = 50_000
 SEED = 1337
 
-TOTAL_GAMMAS_EVENTS = 400_000
-TOTAL_NSB_EVENTS = 200_000
+TOTAL_GAMMAS_EVENTS = 1_000_000
+TOTAL_NSB_EVENTS = 400_000
 
 # Cross-validation folds (leakage detector -- see examples/stats_hexcnn.py and
 # triggerkit.augment for the rationale). Each fold reindexes gamma by an exact
@@ -42,37 +42,70 @@ TOTAL_NSB_EVENTS = 200_000
 # once and frozen, so a metric shift across folds flags a model leaking on
 # orientation / specific pixels. All folds are written into ONE stats HDF5.
 #
-# How to define folds -- FOLD_SPECS is an arbitrary-length list of
-# (gamma_deg, nsb_kind) rows, turned into augment.Fold objects by
-# make_rotation_folds(chain.geom, FOLD_SPECS, seed=SEED). Each row:
-#   gamma_deg : an EXACT camera-rotation symmetry. For this 3-fold camera that
-#               is a multiple of 120 (0/120/240); any other angle raises loudly
-#               rather than silently misplacing pixels. 0 = no rotation.
-#   nsb_kind  : how the NSB pixels are reshuffled at the frozen tau --
-#       "original"            -> identity (no reshuffle)
-#       "rolled"              -> circular roll of the pixel list, default shift P//2
-#       "shuffle"             -> random permutation, default seed = SEED + row_index
-#     Override the parameter by passing a tuple instead of the bare string:
-#       ("rolled", 50)        -> roll by exactly 50 pixels
-#       ("shuffle", 2024)     -> shuffle with a pinned seed (reproducible)
+# How to define folds -- FOLD_SPECS is an arbitrary-length list of dicts, turned
+# into augment.Fold objects by make_rotation_folds(chain.geom, FOLD_SPECS,
+# seed=SEED). Every key is optional; an empty dict {} is the untouched reference
+# fold. The key names are exactly the ones stored in each fold's `config` in the
+# output HDF5, so the spec here and the file read the same. A typo raises.
+#
+#   gamma_deg        (0)          EXACT camera-rotation symmetry applied to the
+#                                 gamma rows. This camera is 3-fold, so only
+#                                 multiples of 120 (0/120/240) are valid; any
+#                                 other angle raises loudly rather than silently
+#                                 misplacing pixels.
+#   gamma_time_shift (0)          circular roll, in samples, of the GAMMA
+#                                 waveform along the time axis. Moves the pulse
+#                                 in time to test whether the model leaked its
+#                                 absolute temporal position. Keep it small
+#                                 (2-5) so the pulse stays inside the 50-sample
+#                                 window.
+#   nsb_kind         ("original") pixel transform applied to the NSB rows:
+#                                   "original" -> identity (no reshuffle)
+#                                   "rolled"   -> circular roll of the pixel list
+#                                   "shuffle"  -> random permutation
+#   nsb_param        (None)       the parameter for nsb_kind: the roll shift for
+#                                 "rolled" (default P//2), the seed for
+#                                 "shuffle" (default SEED + row index). Ignored
+#                                 by "original".
+#   nsb_time_shift   (0)          circular roll, in samples, of the NSB waveform
+#                                 along the time axis -- the counterpart of
+#                                 gamma_time_shift.
+#   name             (auto)       explicit fold name. Auto-derived otherwise as
+#                                 rot<deg>_<kind><param>[_troll<g>][_ntroll<n>].
+#
+# On rolling in time: rolling the GAMMAS ALONE moves the signal while tau stays
+# tuned on un-rolled NSB, so the two classes are no longer treated alike and the
+# efficiency change mixes real temporal leakage with the trigger's own response
+# to the window edges. Set gamma_time_shift AND nsb_time_shift to the same value
+# for the fair test -- a time-translation-invariant trigger then returns the same
+# gamma efficiency AND the same NSB rate as the reference fold.
 #
 # Add / remove / reorder rows freely. The FIRST row is the reference fold: the
 # report compares every other fold against it, and its counts become the file's
 # top-level attrs. Set FOLD_SPECS = None to run a single plain (fold-free) pass.
 FOLD_SPECS = [
-    # check the rotation symmetry
-    (0,   "original"),          # reference: no rotation, no NSB reshuffle
-    (120, "original"),          # +120 deg, no NSB reshuffle
-    (240, "original"),          # +240 deg, no NSB reshuffle
-    # now check nsb
-    (0,   ("rolled", 1)),   
-    (0,   ("rolled", 42)),   
-    (0, ("shuffle", 2024)),
-    # some mix
-    (120, ("rolled", 1)),
-    (240, ("rolled", 1)),
-    (120, ("shuffle", 2024)),
-    (240, ("shuffle", 2024)),
+    # --- rotation symmetry ---------------------------------------------------
+    {},                                                       # reference fold
+    {"gamma_deg": 120},
+    {"gamma_deg": 240},
+    # --- NSB pixel transforms ------------------------------------------------
+    {"nsb_kind": "rolled",  "nsb_param": 1},
+    {"nsb_kind": "rolled",  "nsb_param": 42},
+    {"nsb_kind": "shuffle", "nsb_param": 2024},
+    # --- mixes ---------------------------------------------------------------
+    {"gamma_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"gamma_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"gamma_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"gamma_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
+    # --- temporal position: gammas only (the UNFAIR half, kept for reference) -
+    {"gamma_time_shift": 2},
+    {"gamma_time_shift": 5},
+    # --- temporal position: BOTH classes rolled (the fair test) ---------------
+    {"gamma_time_shift": 2, "nsb_time_shift": 2},
+    {"gamma_time_shift": 5, "nsb_time_shift": 5},
+    # --- temporal position: NSB only (isolates the noise side) ---------------
+    {"nsb_time_shift": 5, "name": "nsb_only_troll5"},
+    {"nsb_time_shift": 2, "name": "nsb_only_troll2"},
 ]
 
 n_folds = len(FOLD_SPECS)
@@ -92,7 +125,9 @@ MAX_NSB_EVENTS = TOTAL_NSB_EVENTS // n_folds
 # hi <= lo. Don't set EDGES_RANGE = None -- that would crash on edges_range[1].
 EDGES_RANGE = (16, 128)   # (lo, hi) span the quantizer edges cover
 EDGES_NUM_BIT = 4         # bit depth -> 2**4 - 1 = 15 levels
-EDGES_FUNC = generate_lin_space_edges   # edge-placement fn (from triggerkit.models); None disables the quantizer
+# EDGES_FUNC = generate_lin_space_edges   # edge-placement fn (from triggerkit.models); None disables the quantizer
+EDGES_FUNC = None   # edge-placement fn (from triggerkit.models); None disables the quantizer
+
 
 # Inner accumulator quantization (the FPGA fixed-point path inside the TDSCAN
 # filter). Each qspec is "<U|S>Q<int_bits>.<frac_bits>": UQ4.0 = unsigned 4-bit
@@ -103,14 +138,16 @@ EDGES_FUNC = generate_lin_space_edges   # edge-placement fn (from triggerkit.mod
 #       accumulator qspec and its post-accumulation right-shift
 #   temporal_accumulator  / temporal_rescale_shift       -> same for the time sum
 # Set to None to run in full float (no inner quantization).
-QUANTIZE_STEP = {
-    "input": "UQ4.0",
-    "ring_weights": "UQ3.1",
-    "convolution_accumulator": "SQ9.0",
-    "convolution_rescale_shift": 0,
-    "temporal_accumulator": "SQ9.0",
-    "temporal_rescale_shift": 0,
-}
+# QUANTIZE_STEP = {
+#     "input": "UQ4.0",
+#     "ring_weights": "UQ3.1",
+#     "convolution_accumulator": "SQ9.0",
+#     "convolution_rescale_shift": 0,
+#     "temporal_accumulator": "SQ9.0",
+#     "temporal_rescale_shift": 0,
+# }
+
+QUANTIZE_STEP = None
 
 # TDSCAN accumulator overflow / rounding + post-accumulation right-shift.
 OVERFLOW_MODE = "AP_SAT"        # saturate on overflow
@@ -125,8 +162,14 @@ SUBTRACT_QUANTIZATION_MODE = "AP_TRN"   # subtract-stage rounding behaviour
 DIGITAL_SUM_MODE = None         # digital-sum stage after TDSCAN summing pixel scores over a patch, e.g. "patch7" (7-pixel patch trigger); None = off
 FADC = False                    # shared FADC baseline-subtraction front-end before TDSCAN; False = off
 
+# TDSCAN kernel geometry -- MUST match the deployed filter (tdscan_chain.py:
+# EPS_XY=1, EPS_T=2) and the RING_WEIGHTS length below.
+EPS_XY = 1
+EPS_T = 2
+
 # Flat ring weights to pin (share_neighbors=True). Length must match the kernel:
-# eps_t=1 -> 6, eps_t=2 -> 10, ... Set to None to keep the build-time init.
+# eps_t=1 -> 6, eps_t=2 -> 10, ... (so with EPS_T=2 this is a 10-value vector).
+# Set to None to keep the build-time init.
 RING_WEIGHTS = np.array(
     [0.5000, 0.0625, -0.5000, -0.0039, -1.0000, -0.2500, 1.0000, 0.1250, 0.5000, 0.2500])
 
@@ -145,6 +188,8 @@ def main():
     chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
     handles = TDSCANBody(
         filters=1,
+        eps_xy=EPS_XY,
+        eps_t=EPS_T,
         edges_range=EDGES_RANGE,
         edges_num_bit=EDGES_NUM_BIT,
         edges_func=EDGES_FUNC,

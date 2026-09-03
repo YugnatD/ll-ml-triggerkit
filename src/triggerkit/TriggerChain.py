@@ -1034,9 +1034,11 @@ class TriggerChain:
     # or slice a single one. `folds=None` is the plain single-pass run (one fold
     # named "all"), byte-for-byte compatible with the old fold-free output.
     if folds is None:
-        fold_plan = [("all", None, None, {})]
+        fold_plan = [("all", None, None, {}, 0, 0)]
     else:
-        fold_plan = [(f.name, f.gamma_index, f.nsb_index, getattr(f, "config", {}))
+        fold_plan = [(f.name, f.gamma_index, f.nsb_index, getattr(f, "config", {}),
+                      int(getattr(f, "gamma_time_shift", 0)),
+                      int(getattr(f, "nsb_time_shift", 0)))
                      for f in folds]
         print(f"Cross-validation: {len(fold_plan)} folds -> "
               f"{[name for name, *_ in fold_plan]}")
@@ -1083,8 +1085,14 @@ class TriggerChain:
     if not expects_baseline:
         print("Model expects 1 input; using waveform only (ignoring pedestal).")
 
-    def make_pack(reindex, gi, ni):
-        """Build the tf.data map fn for one fold (closes over its reindexing)."""
+    def make_pack(reindex, gi, ni, gts=0, nts=0):
+        """Build the tf.data map fn for one fold (closes over its reindexing).
+
+        ``gts`` / ``nts`` are per-class circular time-sample rolls of the
+        waveform (gamma / NSB); 0 = none. They move the pulse in time to test
+        whether the model leaked the absolute temporal position of the gamma.
+        """
+        time_roll = bool(gts or nts)
         def pack(features, label):
             wf  = tf.cast(features["waveform"], tf.uint16)
             ped = tf.cast(features["pedestal"], tf.int32)
@@ -1102,6 +1110,15 @@ class TriggerChain:
                 sel = tf.where(tf.equal(y, 1)[:, None], gi[None, :], ni[None, :])  # (B, P)
                 wf  = tf.gather(wf, sel, batch_dims=1)
                 ped = tf.gather(ped, sel, batch_dims=1)
+
+            # Per-class temporal roll (waveform only -- the pedestal has no time
+            # axis). Circular roll along the sample axis; gammas by gts, NSB by
+            # nts. Leaves the pedestal untouched.
+            if time_roll:
+                is_g = tf.equal(y, 1)[:, None, None]                # (B,1,1)
+                wf_g = tf.roll(wf, shift=gts, axis=2) if gts else wf
+                wf_n = tf.roll(wf, shift=nts, axis=2) if nts else wf
+                wf = tf.where(is_g, wf_g, wf_n)
 
             extra = {
                 "event_id": tf.reshape(tf.cast(features["event_id"], tf.int64), (-1,)),
@@ -1193,7 +1210,7 @@ class TriggerChain:
     try:
         # Each fold is a full independent pass over the data, streamed into the
         # same writer under its own fold index (all folds share one HDF5 file).
-        for fold_name, gamma_idx, nsb_idx, fold_cfg in fold_plan:
+        for fold_name, gamma_idx, nsb_idx, fold_cfg, gts, nts in fold_plan:
             reindex = gamma_idx is not None or nsb_idx is not None
             if reindex:
                 gi = tf.constant(
@@ -1202,10 +1219,14 @@ class TriggerChain:
                 ni = tf.constant(
                     np.arange(self.num_pixels) if nsb_idx is None else np.asarray(nsb_idx),
                     dtype=tf.int32)
-                print(f"\n=== fold '{fold_name}' (reindex active, P={self.num_pixels}) ===")
+                extra_msg = f", time_roll g={gts}/n={nts}" if (gts or nts) else ""
+                print(f"\n=== fold '{fold_name}' (reindex active, P={self.num_pixels}{extra_msg}) ===")
             else:
                 gi = ni = None
-                print(f"\n=== fold '{fold_name}' ===")
+                if gts or nts:
+                    print(f"\n=== fold '{fold_name}' (time_roll g={gts}/n={nts}) ===")
+                else:
+                    print(f"\n=== fold '{fold_name}' ===")
 
             writer.begin_fold(fold_name, fold_cfg)
 
@@ -1217,7 +1238,7 @@ class TriggerChain:
                 config=cfg
             )
             ds = (stats_dataset.dataset()
-                  .map(make_pack(reindex, gi, ni), num_parallel_calls=tf.data.AUTOTUNE)
+                  .map(make_pack(reindex, gi, ni, gts, nts), num_parallel_calls=tf.data.AUTOTUNE)
                   .prefetch(tf.data.AUTOTUNE))
 
             # Per-fold accumulators.
@@ -1936,6 +1957,7 @@ class TriggerChain:
     rangenpe=None,
     rangenpe2=None, # in case we search for an event captured by two 2 different telescopes
     skip_first_n_events=-1,
+    time_roll=0,  # circular roll (samples) of the raw waveform on the time axis before the chain -- mirrors the gamma_time_shift CV fold augmentation
     generate_image_gif=False,
     # limit_telescope=None, # to limit the number of telescope for each event, if 1, 
     cmap='inferno',
@@ -1982,6 +2004,13 @@ class TriggerChain:
     # 3. Build waveform list per stage
     #    wf_list_result[stage][tel] has shape (n_pixels, n_samples)
     # --------------------------------------------------------------
+    # Optional temporal augmentation: circularly roll the raw waveform on the
+    # sample axis, exactly like the gamma_time_shift CV fold (tf.roll axis=S).
+    # Applied before any stage so every displayed stage sees the shifted pulse.
+    if time_roll:
+        wf_list_telescope = [np.roll(wf, int(time_roll), axis=1) for wf in wf_list_telescope]
+        print(f"Applied time_roll={int(time_roll)} sample(s) to the raw waveform.")
+
     wf_list_result = [wf_list_telescope]
 
     # for stage in self.stages:

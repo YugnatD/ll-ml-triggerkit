@@ -31,12 +31,12 @@ from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
 
 # --- Config ------------------------------------------------------------------
-BASE_NAME = "simu"
+BASE_NAME = "simu_cross"
 TARGET_RATE_HZ = 50_000
 SEED = 1337
 
-TOTAL_GAMMAS_EVENTS = 400_000
-TOTAL_NSB_EVENTS = 200_000
+TOTAL_GAMMAS_EVENTS = 1_000_000
+TOTAL_NSB_EVENTS = 400_000
 
 # Threshold seed / sharpness. tau is retuned to TARGET_RATE_HZ below; TAU_INIT is
 # only the starting point. binary_output=True -> hard fire/no-fire decision.
@@ -54,16 +54,42 @@ SUBTRACT_VALUE = None
 # gamma efficiency MUST be invariant under a camera-rotation symmetry, and the
 # NSB rate MUST be invariant under an NSB reshuffle. Any drift here is a bug in
 # the geometry / patch map, not model leakage. Set FOLD_SPECS = None to run a
-# single plain (fold-free) pass. See stats_tdscan.py for the row syntax.
+# single plain (fold-free) pass.
+#
+# Each row is a dict; every key is optional and {} is the untouched reference
+# fold. Keys: gamma_deg (0), gamma_time_shift (0), nsb_kind ("original"),
+# nsb_param (None), nsb_time_shift (0), name (auto). An unknown key raises. See
+# stats_tdscan.py for the full description of each key.
+#
+# patch7 has no temporal filter with an edge to trip over, so the time-roll folds
+# below are the CONTROL for the TDSCAN ones: patch7 efficiency and rate should be
+# flat under every roll. Any drift TDSCAN shows and patch7 does not is TDSCAN's.
+#
+# NOTE: kept IDENTICAL to examples/stats_tdscan.py so the two runs are directly
+# comparable fold-by-fold. If you change the folds in one, change both.
 FOLD_SPECS = [
-    # rotation symmetry (efficiency must stay flat)
-    (0,   "original"),          # reference: no rotation, no NSB reshuffle
-    (120, "original"),          # +120 deg
-    (240, "original"),          # +240 deg
-    # NSB reshuffle (rate must stay flat)
-    (0,   ("rolled", 1)),
-    (0,   ("rolled", 42)),
-    (0,   ("shuffle", 2024)),
+    # --- rotation symmetry ---------------------------------------------------
+    {},                                                       # reference fold
+    {"gamma_deg": 120},
+    {"gamma_deg": 240},
+    # --- NSB pixel transforms ------------------------------------------------
+    {"nsb_kind": "rolled",  "nsb_param": 1},
+    {"nsb_kind": "rolled",  "nsb_param": 42},
+    {"nsb_kind": "shuffle", "nsb_param": 2024},
+    # --- mixes ---------------------------------------------------------------
+    {"gamma_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"gamma_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"gamma_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"gamma_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
+    # --- temporal position: gammas only (the UNFAIR half, kept for reference) -
+    {"gamma_time_shift": 2},
+    {"gamma_time_shift": 5},
+    # --- temporal position: BOTH classes rolled (the fair test) ---------------
+    {"gamma_time_shift": 2, "nsb_time_shift": 2},
+    {"gamma_time_shift": 5, "nsb_time_shift": 5},
+    # --- temporal position: NSB only (isolates the noise side) ---------------
+    {"nsb_time_shift": 5, "name": "nsb_only_troll5"},
+    {"nsb_time_shift": 2, "name": "nsb_only_troll2"},
 ]
 
 n_folds = len(FOLD_SPECS) if FOLD_SPECS is not None else 1

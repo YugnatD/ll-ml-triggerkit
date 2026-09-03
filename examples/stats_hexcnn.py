@@ -46,14 +46,32 @@ MAX_NSB_EVENTS = None
 # model learned the physics, efficiency + rate stay flat across folds; if it
 # cheated (fixed orientation, hot pixels, pedestal artefact), they shift -- and
 # that shift is what the per-fold report exposes. Arbitrary length: add/remove
-# rows freely. Gamma degrees must be exact symmetries (multiples of 120 for this
-# 3-fold camera); non-symmetric angles raise loudly rather than misplace pixels.
-# nsb_kind is "original" / "rolled" / "shuffle" (or ("rolled", shift) /
-# ("shuffle", seed) to pin the parameter). Set to None to run fold-free.
+# rows freely. Set FOLD_SPECS = None to run fold-free.
+#
+# Each row is a dict; every key is optional and {} is the untouched reference
+# fold. Keys (defaults in brackets):
+#   gamma_deg        [0]           camera rotation on the gamma rows. Must be an
+#                                  exact symmetry -- a multiple of 120 for this
+#                                  3-fold camera; other angles raise loudly
+#                                  rather than misplace pixels.
+#   gamma_time_shift [0]           circular roll of the GAMMA waveform in samples
+#   nsb_kind         ["original"]  "original" / "rolled" / "shuffle"
+#   nsb_param        [None]        roll shift or shuffle seed (kind default if None)
+#   nsb_time_shift   [0]           circular roll of the NSB waveform in samples
+#   name             [auto]        explicit fold name
+# An unknown key raises, so typos surface immediately.
+#
+# The time-roll folds test whether the CNN leaked the absolute temporal position
+# of the pulse. Roll the gammas alone and the signal moves while tau stays tuned
+# on un-rolled NSB -- the classes are no longer treated alike. Roll BOTH by the
+# same amount for the fair test: a time-translation-invariant trigger returns the
+# same gamma efficiency AND the same NSB rate as the reference fold.
 FOLD_SPECS = [
-    (0,   "original"),
-    (120, "rolled"),
-    (240, "shuffle"),
+    {},                                                # reference fold
+    {"gamma_deg": 120, "nsb_kind": "rolled"},
+    {"gamma_deg": 240, "nsb_kind": "shuffle"},
+    {"gamma_time_shift": 5},                           # gammas only
+    {"gamma_time_shift": 5, "nsb_time_shift": 5},      # both -> fair test
 ]
 
 

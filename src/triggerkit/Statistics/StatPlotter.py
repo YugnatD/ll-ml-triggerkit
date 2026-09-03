@@ -2337,6 +2337,197 @@ class StatPlotter:
             plt.close("all")
             return os.path.exists(filename)
 
+    # ------------------------------------------------------------------ #
+    # Cross-validation (per-fold leakage) plot
+    # ------------------------------------------------------------------ #
+    def _cv_label_for_chain(self, chain: ConfigType) -> str:
+        """Short human label for a chain (stage types + threshold)."""
+        try:
+            stages = [str(stage[0]) for stage in chain]
+        except Exception:
+            return "chain"
+        thr = self._extract_threshold_from_chain(chain)
+        core = "+".join(s for s in stages if s != "threshold") or "chain"
+        return f"{core} (thr={thr:.3g})" if thr is not None else core
+
+    def _read_folds_group(self, h5_path: str) -> Optional[List[Dict[str, Any]]]:
+        """Read the `/folds` summary table of one stats file.
+
+        Returns a list of per-fold dicts (name, counts, rate, window_sec) with
+        gamma efficiency + NSB rate Wilson errors already attached, or None when
+        the file has no `/folds` group (a plain single-fold / pre-fold file).
+        """
+        if h5py is None:
+            raise RuntimeError("h5py is not installed but a fold read was requested.")
+
+        def s(x):
+            return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+        with h5py.File(h5_path, "r") as f:
+            if "folds" not in f:
+                return None
+            g = f["folds"]
+            window_sec = self._read_window_sec(f.attrs)
+            names = [s(x) for x in g["name"][()]]
+            gt = g["gamma_trig"][()]; gtot = g["gamma_total"][()]
+            nt = g["nsb_trig"][()];   ntot = g["nsb_total"][()]
+            rate = g["trigger_rate_hz"][()]
+            folds = []
+            for i, name in enumerate(names):
+                eff, elo, ehi = wilson(int(gt[i]), int(gtot[i]), self.wilson_level)
+                _, rlo, rhi = wilson(int(nt[i]), int(ntot[i]), self.wilson_level)
+                folds.append({
+                    "fold": name,
+                    "eff": eff, "eff_err": max(elo, ehi),
+                    "rate_hz": float(rate[i]),
+                    "rate_err": max(rlo, rhi) / window_sec,
+                })
+            return folds
+
+    def _resolve_cv_rows(
+        self,
+        configs: Optional[List[ConfigType]],
+        legend_overrides: Optional[List[Optional[str]]],
+    ) -> List[Tuple[str, List[Dict[str, Any]]]]:
+        """Resolve the ``(label, folds)`` rows to draw for the CV plot.
+
+        ``configs=None`` picks every loaded stats file carrying a ``/folds``
+        group; otherwise each config is matched to its file. Files without a
+        ``/folds`` group are silently skipped (they are plain single-pass runs).
+        """
+        rows: List[Tuple[str, List[Dict[str, Any]]]] = []
+        if configs is None:
+            seen = set()
+            for _fn, res in self.all_results:
+                path = res.get("_path")
+                if not path or path in seen:
+                    continue
+                seen.add(path)
+                folds = self._read_folds_group(path)
+                if folds:
+                    rows.append((self._cv_label_for_chain(res.get("trigger_chain", [])), folds))
+        else:
+            for i, config in enumerate(configs):
+                res = self.get_results(config)
+                if res is None or not self._is_h5(res):
+                    self._warn_once(f"cv-miss-{i}", f"cross-validation: no stats file matched config #{i}; skipping.")
+                    continue
+                folds = self._read_folds_group(res["_path"])
+                if not folds:
+                    continue  # plain single-pass file -- nothing to draw
+                label = None
+                if legend_overrides and i < len(legend_overrides):
+                    label = legend_overrides[i]
+                rows.append((label or self._cv_label_for_chain(res.get("trigger_chain", [])), folds))
+        return rows
+
+    def _draw_cross_validation(
+        self,
+        rows: List[Tuple[str, List[Dict[str, Any]]]],
+        n_sigma: float = 3.0,
+    ) -> "plt.Figure":
+        """Draw the per-fold eff + NSB-rate grid onto a fresh figure and return it.
+
+        One row per config: gamma efficiency vs fold (left), NSB rate vs fold
+        (right), Wilson error bars, a dashed fold-0 reference and an ``n_sigma``
+        band around it. Flat across folds = no leak.
+        """
+        n = len(rows)
+        fig, axes = plt.subplots(n, 2, figsize=(11.5, 3.3 * n), squeeze=False)
+        for r, (label, folds) in enumerate(rows):
+            names = [d["fold"] for d in folds]
+            xs = np.arange(len(folds))
+            for c, (key, err, ylab, sub) in enumerate([
+                ("eff", "eff_err", "gamma efficiency", "Gamma efficiency vs fold"),
+                ("rate_hz", "rate_err", "NSB rate [Hz]", "NSB rate vs fold"),
+            ]):
+                ax = axes[r][c]
+                ax.errorbar(xs, [d[key] for d in folds], yerr=[d[err] for d in folds],
+                            fmt="o-", capsize=4)
+                ref = folds[0]
+                ax.axhline(ref[key], ls="--", c="gray", alpha=0.6, label="fold-0")
+                band = n_sigma * ref[err]
+                ax.axhspan(ref[key] - band, ref[key] + band, color="gray", alpha=0.10,
+                           label=f"±{n_sigma:g}σ")
+                ax.set_xticks(xs); ax.set_xticklabels(names, rotation=20, ha="right")
+                ax.set_ylabel(ylab)
+                ax.set_title(f"{label}: {sub}")
+                ax.legend(loc="best")
+        fig.tight_layout()
+        return fig
+
+    def _render_cross_validation(
+        self,
+        configs: Optional[List[ConfigType]],
+        legend_overrides: Optional[List[Optional[str]]],
+        full_path: str,
+        show: bool,
+        n_sigma: float = 3.0,
+    ) -> bool:
+        """Report-integrated CV render: PNG into ``full_path`` + stash for the PDF.
+
+        Mirrors the other ``_render_*`` helpers so the cross-validation graph
+        becomes one section INSIDE the report (report.md image + a vector PDF
+        page), rather than a standalone file. Returns False (drawing nothing)
+        when no config has a ``/folds`` group.
+        """
+        rows = self._resolve_cv_rows(configs, legend_overrides)
+        if not rows:
+            return False
+        with self._report_style_context():
+            plt.close("all")
+            self._draw_cross_validation(rows, n_sigma=n_sigma)
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
+    def plot_cross_validation(
+        self,
+        configs: Optional[List[ConfigType]] = None,
+        output_dir: str = "trigger_report",
+        filename: str = "cross_validation",
+        n_sigma: float = 3.0,
+        legend_overrides: Optional[List[Optional[str]]] = None,
+        formats: Tuple[str, ...] = ("png",),
+        show: bool = False,
+    ) -> Optional[str]:
+        """Standalone per-fold gamma efficiency + NSB rate cross-validation plot.
+
+        Renders the leakage-detector graph from the ``/folds`` group written by
+        ``compute_statistics(folds=...)``: one row per config, gamma efficiency
+        vs fold (left) and NSB rate vs fold (right), with Wilson error bars and a
+        dashed fold-0 reference. A physically-honest trigger is FLAT across folds
+        (efficiency invariant under camera rotation, rate invariant under an NSB
+        reshuffle); a drift beyond ``n_sigma`` of fold-0's band is a leak.
+
+        This writes a STANDALONE file (one per entry in ``formats``). The same
+        graph is embedded automatically as a section of ``generateReport`` when
+        any plotted config carries folds, so you rarely need to call this
+        directly. ``configs=None`` picks every loaded file that has folds.
+        Returns the first written path, or None if no config had folds.
+        """
+        rows = self._resolve_cv_rows(configs, legend_overrides)
+        if not rows:
+            print("plot_cross_validation: no config with a /folds group; nothing to plot.")
+            return None
+
+        fig = self._draw_cross_validation(rows, n_sigma=n_sigma)
+        os.makedirs(output_dir, exist_ok=True)
+        written = []
+        for ext in formats:
+            path = os.path.join(output_dir, f"{filename}.{ext}")
+            fig.savefig(path, bbox_inches="tight", dpi=200)
+            written.append(path)
+        if show:
+            plt.show()
+        plt.close(fig)
+        print(f"plot_cross_validation: wrote {', '.join(written)}")
+        return written[0] if written else None
+
     def generateReport(
         self,
         configs: Optional[List[ConfigType]] = None,
@@ -2371,6 +2562,8 @@ class StatPlotter:
         energy_bins: int = 70,
         impact_distance_range: Optional[Tuple[float, float]] = None,
         impact_distance_bins: int = 40,
+        cross_validation: bool = True,
+        cross_validation_n_sigma: float = 3.0,
     ) -> str:
         """
         Generate a markdown report plus the main plots commonly used in the
@@ -2565,6 +2758,20 @@ class StatPlotter:
             roc_path = os.path.join(output_dir, "roc_curves.png")
             if self._render_roc_curves(report_plot_items, roc_path, show):
                 combined_sections.append(("ROC Curve (gamma vs NSB)", "roc_curves.png"))
+
+            # Cross-validation (per-fold leakage) -- only when a config carries a
+            # /folds group. One row per config: gamma efficiency + NSB rate vs
+            # fold with Wilson bars; flat = no leak. Embedded as a report section
+            # (no standalone file).
+            if cross_validation:
+                cv_configs = [cfg for cfg, _l, _s, _n in config_descriptions]
+                cv_labels = [short_name for _c, _l, _s, short_name in config_descriptions]
+                cv_path = os.path.join(output_dir, "cross_validation.png")
+                if self._render_cross_validation(
+                    cv_configs, cv_labels, cv_path, show, n_sigma=cross_validation_n_sigma,
+                ):
+                    combined_sections.append(
+                        ("Cross-Validation (per-fold gamma efficiency & NSB rate)", "cross_validation.png"))
 
             # n_pe vs energy correlation (whole gamma sample).
             npe_energy_path = os.path.join(output_dir, "npe_vs_energy.png")

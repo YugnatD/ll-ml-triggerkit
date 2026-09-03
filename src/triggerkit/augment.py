@@ -31,6 +31,27 @@ Value transforms (e.g. perturbing the pedestal) do not fit the index-vector
 model; add them later as a separate fold kind. The plumbing in
 ``TriggerChain.compute_statistics`` applies ``idx`` to waveform *and* pedestal
 together (the baseline rotates with the camera).
+
+Temporal roll (a second fold axis)
+----------------------------------
+A :class:`Fold` may ALSO carry a ``gamma_time_shift`` and an ``nsb_time_shift``
+-- integer circular rolls of the waveform along the time-sample axis ``S``,
+applied per class (``compute_statistics`` uses ``tf.roll`` on the ``(B, P, S)``
+waveform, NOT the ``(B, P)`` pedestal, which has no time axis). This is a
+*value* transform, orthogonal to the pixel index above: it moves the waveform in
+time to test whether the model leaked the absolute temporal position of the
+pulse. A physically-honest trigger's efficiency is flat under this roll; a drop
+means it learned "the pulse always peaks near sample k".
+
+Roll the GAMMAS ONLY and you are testing the signal side against a threshold
+tuned on un-rolled NSB -- the two sides are no longer treated alike, so a change
+in efficiency mixes real temporal leakage with the model's own response to the
+window edges. Roll BOTH classes by the same amount for the fair test: a
+time-translation-invariant trigger returns identical gamma efficiency AND
+identical NSB rate. (This matters in practice: a filter whose temporal kernel is
+zero-padded at the window boundary under-scores pulses sitting on the first and
+last samples, so rolling moves them out of that blind spot and shifts the NSB
+rate even though NSB values are perfectly stationary in time.)
 """
 
 import numpy as np
@@ -115,41 +136,130 @@ class Fold:
     HDF5 so the file is self-describing and reproducible.
     """
 
-    def __init__(self, name, gamma_index, nsb_index, config=None):
+    def __init__(self, name, gamma_index, nsb_index, config=None,
+                 gamma_time_shift=0, nsb_time_shift=0):
         self.name = str(name)
         self.gamma_index = np.asarray(gamma_index, dtype=np.int64)
         self.nsb_index = np.asarray(nsb_index, dtype=np.int64)
         self.config = dict(config or {})
+        # Circular roll of the waveform along the time-sample axis (samples).
+        # Applied waveform-only, per class; 0 = no temporal shift.
+        self.gamma_time_shift = int(gamma_time_shift)
+        self.nsb_time_shift = int(nsb_time_shift)
         if self.gamma_index.shape != self.nsb_index.shape:
             raise ValueError(
                 f"fold {name!r}: gamma_index {self.gamma_index.shape} and "
                 f"nsb_index {self.nsb_index.shape} must have the same length.")
 
     def __repr__(self):
-        return f"Fold(name={self.name!r}, P={self.gamma_index.size})"
+        return (f"Fold(name={self.name!r}, P={self.gamma_index.size}, "
+                f"gamma_time_shift={self.gamma_time_shift}, "
+                f"nsb_time_shift={self.nsb_time_shift})")
+
+
+#: Keys accepted by a dict-form fold spec, with their defaults.
+FOLD_SPEC_KEYS = {
+    "name": None,                # optional explicit fold name (auto-derived if None)
+    "gamma_deg": 0,              # camera rotation applied to gamma rows (degrees)
+    "gamma_time_shift": 0,       # circular roll of the gamma waveform, in samples
+    "nsb_kind": "original",      # pixel transform for NSB: original / rolled / shuffle
+    "nsb_param": None,           # roll shift or shuffle seed (kind-dependent)
+    "nsb_time_shift": 0,         # circular roll of the NSB waveform, in samples
+}
+
+
+def _normalize_spec(spec, i):
+    """Return ``(gamma_deg, gamma_time_shift, kind, param, nsb_time_shift, name)``.
+
+    Accepts the dict form (preferred, self-documenting) or the legacy
+    ``(gamma_aug, nsb_aug)`` tuple form.
+    """
+    if isinstance(spec, dict):
+        unknown = set(spec) - set(FOLD_SPEC_KEYS)
+        if unknown:
+            raise ValueError(
+                f"fold spec #{i}: unknown key(s) {sorted(unknown)}; "
+                f"allowed keys are {sorted(FOLD_SPEC_KEYS)}.")
+        g = dict(FOLD_SPEC_KEYS, **spec)
+        return (g["gamma_deg"], int(g["gamma_time_shift"]), g["nsb_kind"],
+                g["nsb_param"], int(g["nsb_time_shift"]), g["name"])
+
+    gamma_aug, nsb_aug = spec
+    # gamma_aug: a bare rotation `deg`, or `(deg, time_shift)`.
+    if isinstance(gamma_aug, (tuple, list)):
+        gamma_deg = gamma_aug[0]
+        gamma_time_shift = int(gamma_aug[1]) if len(gamma_aug) > 1 else 0
+    else:
+        gamma_deg, gamma_time_shift = gamma_aug, 0
+    # nsb_aug: a bare kind string, `(kind, param)`, `(kind, param, time_shift)`
+    # or `{"kind":..., "param":..., "time_shift":...}`. The trailing time_shift
+    # mirrors the gamma `(deg, time_shift)` form.
+    if isinstance(nsb_aug, str):
+        kind, param, nsb_time_shift = nsb_aug, None, 0
+    elif isinstance(nsb_aug, dict):
+        kind = nsb_aug["kind"]
+        param = nsb_aug.get("param")
+        nsb_time_shift = int(nsb_aug.get("time_shift", 0))
+    else:
+        kind = nsb_aug[0]
+        param = nsb_aug[1] if len(nsb_aug) > 1 else None
+        nsb_time_shift = int(nsb_aug[2]) if len(nsb_aug) > 2 else 0
+    return gamma_deg, gamma_time_shift, kind, param, nsb_time_shift, None
 
 
 def make_rotation_folds(geometry, specs, *, seed=1337, tol_frac=0.1):
-    """Build a list of :class:`Fold` from compact ``(gamma_deg, nsb_kind)`` specs.
+    """Build a list of :class:`Fold` from compact fold specs.
 
-    ``specs`` is any-length list of ``(gamma_deg, nsb_kind)`` where ``nsb_kind`` is
-    one of ``"original"``, ``"rolled"``, ``"shuffle"`` -- or a tuple
-    ``("rolled", shift)`` / ``("shuffle", seed)`` to override the parameter. The
-    NSB seed defaults to ``seed + fold_position`` so different shuffle folds get
-    distinct-but-reproducible permutations.
+    PREFERRED -- each spec row is a flat dict, with every key optional; the key
+    names are exactly those stored in the per-fold ``config`` of the statistics
+    HDF5, so the spec and the output file read the same::
 
-    Example (your draft)::
+        make_rotation_folds(chain.geom, [
+            {},                                                  # reference fold
+            {"gamma_deg": 120},                                  # rotate gammas
+            {"nsb_kind": "shuffle", "nsb_param": 2024},          # reshuffle NSB pixels
+            {"gamma_time_shift": 5},                             # roll gammas only
+            {"gamma_time_shift": 5, "nsb_time_shift": 5},        # roll BOTH (fair test)
+            {"nsb_time_shift": 5, "name": "nsb_only_troll5"},    # roll NSB only
+        ])
 
-        make_rotation_folds(chain.geom, [(0, "original"),
-                                         (120, "rolled"),
-                                         (240, "shuffle")])
+    Keys and defaults: ``name`` (auto), ``gamma_deg`` (0),
+    ``gamma_time_shift`` (0), ``nsb_kind`` ("original"), ``nsb_param`` (None),
+    ``nsb_time_shift`` (0). An unknown key raises, so typos surface immediately.
+
+    LEGACY -- a row may also be the older ``(gamma_aug, nsb_aug)`` tuple:
+
+    * ``gamma_aug`` is either a bare rotation ``deg`` (int), or a tuple
+      ``(deg, time_shift)`` where ``time_shift`` is an integer circular roll (in
+      samples) of the gamma waveform along the time axis (e.g. ``(120, 3)``
+      rotates the camera 120 deg AND rolls the gamma pulse 3 samples later). A
+      bare ``deg`` means no temporal roll.
+    * ``nsb_aug`` is one of ``"original"``, ``"rolled"``, ``"shuffle"`` -- or a
+      tuple ``("rolled", shift)`` / ``("shuffle", seed)`` to override the pixel
+      parameter, or ``(kind, param, time_shift)`` to ALSO roll the NSB waveform
+      in time (mirroring the gamma ``(deg, time_shift)`` form). A dict
+      ``{"kind": ..., "param": ..., "time_shift": ...}`` is accepted too when
+      the positional form gets hard to read. The NSB seed defaults to
+      ``seed + fold_position`` so different shuffle folds get
+      distinct-but-reproducible permutations.
+
+    (Backward-compatible: a bare-``deg`` gamma_aug means the old
+    ``(deg, nsb_kind)`` rows parse unchanged.)
+
+    Legacy example::
+
+        make_rotation_folds(chain.geom, [(0,          "original"),
+                                         (120,        "rolled"),
+                                         ((120, 2),   ("shuffle", 2024)),     # rot120 + gamma roll +2
+                                         ((0, 5),     ("original", None, 5))]) # both rolled +5
     """
     P = int(geometry.n_pixels)
     folds = []
     used_names = {}
-    for i, (gamma_deg, nsb_kind) in enumerate(specs):
+    for i, spec in enumerate(specs):
+        (gamma_deg, gamma_time_shift, kind, param,
+         nsb_time_shift, explicit_name) = _normalize_spec(spec, i)
         gamma_idx = rotation_index(geometry, gamma_deg, tol_frac=tol_frac)
-        kind, param = (nsb_kind, None) if isinstance(nsb_kind, str) else nsb_kind
         if kind == "original":
             nsb_idx = identity_index(P)
             nsb_param = None
@@ -165,18 +275,28 @@ def make_rotation_folds(geometry, specs, *, seed=1337, tol_frac=0.1):
             "gamma_deg": gamma_deg,
             "nsb_kind": kind,
             "nsb_param": nsb_param,
+            "gamma_time_shift": gamma_time_shift,
+            "nsb_time_shift": nsb_time_shift,
             "seed": seed,
         }
         # Fold name must be unique (it keys the /folds table and StatPlotter's
         # fold lookup). Base name is rot<deg>_<kind>; append the param when set,
-        # and a _<n> suffix only if that still collides (e.g. two identical rows).
-        name = f"rot{gamma_deg}_{kind}"
-        if nsb_param is not None:
-            name = f"{name}{nsb_param}"
+        # a _troll<k> suffix for a temporal roll, and a _<n> suffix only if that
+        # still collides (e.g. two identical rows).
+        name = explicit_name or f"rot{gamma_deg}_{kind}"
+        if explicit_name is None:
+            if nsb_param is not None:
+                name = f"{name}{nsb_param}"
+            if gamma_time_shift:
+                name = f"{name}_troll{gamma_time_shift}"
+            if nsb_time_shift:
+                name = f"{name}_ntroll{nsb_time_shift}"
         if name in used_names:
             used_names[name] += 1
             name = f"{name}_{used_names[name]}"
         else:
             used_names[name] = 0
-        folds.append(Fold(name, gamma_idx, nsb_idx, config=config))
+        folds.append(Fold(name, gamma_idx, nsb_idx, config=config,
+                          gamma_time_shift=gamma_time_shift,
+                          nsb_time_shift=nsb_time_shift))
     return folds
