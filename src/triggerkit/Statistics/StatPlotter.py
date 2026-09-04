@@ -2356,6 +2356,13 @@ class StatPlotter:
         Returns a list of per-fold dicts (name, counts, rate, window_sec) with
         gamma efficiency + NSB rate Wilson errors already attached, or None when
         the file has no `/folds` group (a plain single-fold / pre-fold file).
+
+        Each fold also carries a threshold-free ``auc`` (+ ``auc_err``) computed
+        from the stored per-event pre-threshold scores, which is what the CV plot
+        prefers: gamma efficiency at a frozen tau conflates separation power with
+        the working point, so a fold that shifts the NSB score distribution drops
+        the efficiency even when the classes are separated exactly as well. The
+        AUC is NaN for files written without per-event scores.
         """
         if h5py is None:
             raise RuntimeError("h5py is not installed but a fold read was requested.")
@@ -2372,6 +2379,7 @@ class StatPlotter:
             gt = g["gamma_trig"][()]; gtot = g["gamma_total"][()]
             nt = g["nsb_trig"][()];   ntot = g["nsb_total"][()]
             rate = g["trigger_rate_hz"][()]
+            aucs = self._fold_aucs(f, len(names))
             folds = []
             for i, name in enumerate(names):
                 eff, elo, ehi = wilson(int(gt[i]), int(gtot[i]), self.wilson_level)
@@ -2379,10 +2387,45 @@ class StatPlotter:
                 folds.append({
                     "fold": name,
                     "eff": eff, "eff_err": max(elo, ehi),
+                    "auc": aucs[i][0], "auc_err": aucs[i][1],
                     "rate_hz": float(rate[i]),
                     "rate_err": max(rlo, rhi) / window_sec,
                 })
             return folds
+
+    @staticmethod
+    def _auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
+        """Hanley & McNeil standard error of an AUC."""
+        if not np.isfinite(auc) or n_pos < 1 or n_neg < 1:
+            return float("nan")
+        q1 = auc / (2.0 - auc)
+        q2 = 2.0 * auc * auc / (1.0 + auc)
+        var = (auc * (1.0 - auc)
+               + (n_pos - 1) * (q1 - auc * auc)
+               + (n_neg - 1) * (q2 - auc * auc)) / (n_pos * n_neg)
+        return float(np.sqrt(max(var, 0.0)))
+
+    def _fold_aucs(self, f: "h5py.File", n_folds: int) -> List[Tuple[float, float]]:
+        """Per-fold (auc, standard_error) from the per-event pre-threshold scores.
+
+        All-NaN when the file stores no per-event score, which makes the CV plot
+        fall back to gamma efficiency.
+        """
+        nan_pair = (float("nan"), float("nan"))
+        out = [nan_pair] * n_folds
+        grp = f.get("events")
+        if grp is None or "pre_threshold_score" not in grp or "fold" not in grp:
+            return out
+        fold = np.asarray(grp["fold"][()]).reshape(-1)
+        label = np.asarray(grp["label"][()]).reshape(-1)
+        score = np.asarray(grp["pre_threshold_score"][()]).reshape(-1)
+        for i in range(n_folds):
+            m = fold == i
+            pos = score[m & (label == 1)]
+            neg = score[m & (label == 0)]
+            auc = roc_auc_mann_whitney(pos, neg)
+            out[i] = (auc, self._auc_standard_error(auc, pos.size, neg.size))
+        return out
 
     def _resolve_cv_rows(
         self,
@@ -2428,18 +2471,27 @@ class StatPlotter:
     ) -> "plt.Figure":
         """Draw the per-fold eff + NSB-rate grid onto a fresh figure and return it.
 
-        One row per config: gamma efficiency vs fold (left), NSB rate vs fold
-        (right), Wilson error bars, a dashed fold-0 reference and an ``n_sigma``
-        band around it. Flat across folds = no leak.
+        One row per config: separation power vs fold (left), NSB rate vs fold
+        (right), a dashed fold-0 reference and an ``n_sigma`` band around it.
+        Flat across folds = no leak.
+
+        The left panel shows the threshold-free AUC, falling back to gamma
+        efficiency for files stored without per-event scores.
         """
         n = len(rows)
         fig, axes = plt.subplots(n, 2, figsize=(11.5, 3.3 * n), squeeze=False)
         for r, (label, folds) in enumerate(rows):
             names = [d["fold"] for d in folds]
             xs = np.arange(len(folds))
+            has_auc = bool(np.isfinite([d.get("auc", np.nan) for d in folds]).any())
+            first = (("auc", "auc_err", "AUC (gamma vs NSB)",
+                      "Separation power (AUC) vs fold -- threshold-free")
+                     if has_auc else
+                     ("eff", "eff_err", "gamma efficiency",
+                      "Gamma efficiency vs fold (no per-event score stored)"))
             for c, (key, err, ylab, sub) in enumerate([
-                ("eff", "eff_err", "gamma efficiency", "Gamma efficiency vs fold"),
-                ("rate_hz", "rate_err", "NSB rate [Hz]", "NSB rate vs fold"),
+                first,
+                ("rate_hz", "rate_err", "NSB rate [Hz]", "NSB rate vs fold (frozen tau)"),
             ]):
                 ax = axes[r][c]
                 ax.errorbar(xs, [d[key] for d in folds], yerr=[d[err] for d in folds],
@@ -2449,10 +2501,12 @@ class StatPlotter:
                 band = n_sigma * ref[err]
                 ax.axhspan(ref[key] - band, ref[key] + band, color="gray", alpha=0.10,
                            label=f"±{n_sigma:g}σ")
-                ax.set_xticks(xs); ax.set_xticklabels(names, rotation=20, ha="right")
+                ax.set_xticks(xs)
+                ax.set_xticklabels(names, rotation=35, ha="right", fontsize=8)
                 ax.set_ylabel(ylab)
-                ax.set_title(f"{label}: {sub}")
-                ax.legend(loc="best")
+                ax.set_title(f"{label}: {sub}", fontsize=10)
+                ax.grid(alpha=0.3)
+                ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
         return fig
 
@@ -2495,7 +2549,7 @@ class StatPlotter:
         formats: Tuple[str, ...] = ("png",),
         show: bool = False,
     ) -> Optional[str]:
-        """Standalone per-fold gamma efficiency + NSB rate cross-validation plot.
+        """Standalone per-fold AUC + NSB rate cross-validation plot.
 
         Renders the leakage-detector graph from the ``/folds`` group written by
         ``compute_statistics(folds=...)``: one row per config, gamma efficiency
@@ -2771,7 +2825,7 @@ class StatPlotter:
                     cv_configs, cv_labels, cv_path, show, n_sigma=cross_validation_n_sigma,
                 ):
                     combined_sections.append(
-                        ("Cross-Validation (per-fold gamma efficiency & NSB rate)", "cross_validation.png"))
+                        ("Cross-Validation (per-fold AUC & NSB rate)", "cross_validation.png"))
 
             # n_pe vs energy correlation (whole gamma sample).
             npe_energy_path = os.path.join(output_dir, "npe_vs_energy.png")
