@@ -23,6 +23,8 @@ Run it:
     python examples/stats_report.py
 """
 
+import sys
+
 from triggerkit.Statistics.StatPlotter import StatPlotter
 
 TARGET_RATE_HZ = 50_000.0
@@ -30,7 +32,7 @@ TARGET_RATE_HZ = 50_000.0
 # Folders holding the .h5 stat files. These are the outputs of the cross-
 # validation run (stats_patch7.py + stats_tdscan.py, 10 folds each) copied into
 # examples/results/. Point this at your own OUTPUT_FOLDER(s) if you re-run.
-STAT_FOLDERS = ["results"]
+STAT_FOLDERS = sys.argv[1:] or ["results"]
 OUTPUT_DIR = "trigger_report"
 
 # --- Configs (match the actual cross-validation runs in results/) ------------

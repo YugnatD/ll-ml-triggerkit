@@ -21,7 +21,9 @@ pool, relu, the scatter adapter, a threshold -- and swap it freely::
 
 Each list entry is one of:
 
-* a Keras ``Layer`` instance -- applied to the current cursor;
+* a Keras ``Layer`` instance -- applied to the current cursor. If it
+  exposes ``bind_geometry`` and is not bound yet, the camera geometry is
+  supplied first (``ScatterToGrid``, ``MaskCells``);
 * a string naming a stage -- either a :meth:`TriggerChain.add_stage` stage
   (``"global_max_pooling_2d"``, ``"threshold"``, ``"rescaling"``, ...) or an
   adapter (``"scatter_to_grid"``, ``"time_mean"``, ``"global_hex_mean"``);
@@ -82,9 +84,10 @@ class SequentialBody(TriggerBody):
             kwargs = spec[1] if len(spec) > 1 and spec[1] is not None else {}
             return self._apply_named(chain, name, dict(kwargs))
         if isinstance(spec, keras.layers.Layer):
-            # An unbound ScatterToGrid(time_window=...) picks up the camera
-            # geometry here, so it can be declared without a scatter matrix.
-            if isinstance(spec, ScatterToGrid) and not spec.bound:
+            # Any layer that needs the camera geometry picks it up here, so it
+            # can be declared without one -- ScatterToGrid(time_window=...) for
+            # the scatter matrix, MaskCells() for the occupied-cell mask.
+            if hasattr(spec, "bind_geometry") and not getattr(spec, "bound", True):
                 spec.bind_geometry(chain.geom)
             chain.last_layer = spec(chain.last_layer)
             return spec

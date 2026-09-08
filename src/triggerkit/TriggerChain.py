@@ -73,6 +73,45 @@ STATS_EVENT_FLOAT_KEYS = (
 )
 
 
+def _verify_model_reloads(model_path, ckpt_path=None):
+    """Check that a just-saved model can actually be read back.
+
+    A model containing a broken custom layer saves without complaint and only
+    fails months later, at load time, when the training run is long gone. The
+    usual causes are a ``Lambda`` wrapping a Python lambda, a layer whose
+    ``build()`` creates a child layer without building it, and a custom class
+    that was never imported (registration happens on import). Reloading here
+    turns all of them into an immediate, actionable warning.
+
+    Importing ``triggerkit.models`` mirrors what a caller must do, and keeps the
+    registration side effect out of the deliberately light package __init__.
+    """
+    # Reload in a CLEAN subprocess. Doing it in-process would prove nothing about
+    # registration: the training run has already imported every module it uses, so
+    # a class that a user's fresh session cannot resolve still loads fine here.
+    # The subprocess reproduces what the next session actually does.
+    import subprocess, sys as _sys
+    code = ("import triggerkit.models as M;"
+            "M.load_model(%r)" % (str(model_path),))
+    try:
+        r = subprocess.run([_sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            tail = (r.stderr or "").strip().splitlines()
+            raise RuntimeError(tail[-1] if tail else "unknown error")
+    except BaseException as e:
+        print("=" * 70)
+        print(f"WARNING: the model was saved to {model_path} but CANNOT be reloaded.")
+        print(f"         reason: {e}")
+        if ckpt_path is not None:
+            print(f"         the weights-only checkpoint at {ckpt_path} is still usable.")
+        print("         The weights are fine; it is the architecture that will not")
+        print("         deserialize. Fix the custom layer before relying on this file.")
+        print("=" * 70)
+        return False
+    return True
+
+
 class TriggerChain:
   def __init__(self, simtel_path: str, simtel_nsb_path: str = None):
     self.simtel_path = simtel_path
@@ -96,7 +135,7 @@ class TriggerChain:
         # from the geometry get the number of pixels
         self.num_pixels = self.geom.n_pixels
         # from a datacube get the number of samples
-        for tel_ids_list, wf_list, wf1_list, dl0_list, dl1_list, true_image_list, pedestal_per_sample_list, event_stat_list, _ in src:
+        for tel_ids_list, wf_list, wf1_list, dl0_list, dl1_list, true_image_list, _peak_time_list, pedestal_per_sample_list, event_stat_list, _ in src:
             if len(wf_list) > 0:
                 # print(wf_list[0].shape)
                 try:
@@ -625,6 +664,7 @@ class TriggerChain:
             print(f"Saving trained model to {save_path_model}...")
             try:
                 self.model.save(save_path_model)
+                _verify_model_reloads(save_path_model, ckpt_path)
             except BaseException as e:
                 print(f"Full model save failed with error '{e}'. A weights-only checkpoint is available at {ckpt_path}")
         else:
@@ -761,7 +801,7 @@ class TriggerChain:
             with AsyncFileOpenerProcess(simtel_file) as fo:
                 for (
                     tel_ids_list, wf_r0_list, wf_r1_list, _, _, true_image_list,
-                    pedestal_per_sample_list, event_stat_list, _
+                    _peak_time_list, pedestal_per_sample_list, event_stat_list, _
                 ) in fo:
                     if not event_stat_list:
                         continue
@@ -984,6 +1024,7 @@ class TriggerChain:
             print(f"Saving trained model to {save_path_model}...")
             try:
                 self.model.save(save_path_model)
+                _verify_model_reloads(save_path_model, ckpt_path)
             except BaseException as e:
                 print(f"Full model save failed with error '{e}'. A weights-only checkpoint is available at {ckpt_path}")
         else:
@@ -1872,7 +1913,7 @@ class TriggerChain:
     for simtel_file in simtel_files:
         # with FileOpenerCTAO(simtel_file) as fo:
         with AsyncFileOpenerProcess(simtel_file) as fo:
-            for tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list, true_image_list, pedestal_per_sample_list, event_stat_list, i_event in fo:
+            for tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list, true_image_list, _peak_time_list, pedestal_per_sample_list, event_stat_list, i_event in fo:
                 if not event_stat_list:
                     continue
 
@@ -2725,7 +2766,7 @@ class TriggerChain:
     for simtel_file in simtel_files:
         # with FileOpenerCTAO(simtel_file) as fo:
         with AsyncFileOpenerProcess(simtel_file) as fo:
-            for tel_ids_list, wf_list, _, _, _, true_image_list, pedestal_per_sample_list, event_stat_list_per_event, i_event in fo:
+            for tel_ids_list, wf_list, _, _, _, true_image_list, _peak_time_list, pedestal_per_sample_list, event_stat_list_per_event, i_event in fo:
                 for tel_id, stats in zip(tel_ids_list, event_stat_list_per_event):
                     n_pe = stats['n_pe']
                     energy = stats['energy']

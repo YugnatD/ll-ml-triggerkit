@@ -146,6 +146,7 @@ class FileOpenerCTAOHDF5:
                     dl0_list = []
                     dl1_list = []
                     true_image_list = []
+                    peak_time_list = []
                     pedestal_per_sample_list = []
                     event_stat_list = []
                     event_ids = []
@@ -299,6 +300,15 @@ class FileOpenerCTAOHDF5:
                                 ]
                                 image_dl1 = event_dl1["image"].astype(np.float32)
                                 dl1_list.append(image_dl1)
+                            # DL1 peak_time, (P,) samples per pixel, carried in
+                            # its own list exactly like true_image. None when the
+                            # file has no DL1 images.
+                            if event_dl1 is not None and "peak_time" in (
+                                    event_dl1.dtype.names or ()):
+                                peak_time_list.append(
+                                    event_dl1["peak_time"].astype(np.float32))
+                            else:
+                                peak_time_list.append(None)
                             calib_ds = self.calib_tables.get(tel_name, None)
                             # get the true_image for this event and telescope
                             true_image_list.append(sim_image_group[self.current_event_index[tel_idx]]["true_image"].astype(np.float32))
@@ -375,6 +385,7 @@ class FileOpenerCTAOHDF5:
                         dl0_list,
                         dl1_list,
                         true_image_list,
+                        peak_time_list,
                         pedestal_per_sample_list,
                         event_stat_list,
                     )
@@ -407,6 +418,7 @@ class FileOpenerCTAOHDF5:
                 dl0_list,
                 dl1_list,
                 true_image_list,
+                peak_time_list,
                 pedestal_per_sample_list,
                 event_stat_list,
             ) = next(self._iterator)
@@ -417,6 +429,7 @@ class FileOpenerCTAOHDF5:
                 dl0_list,
                 dl1_list,
                 true_image_list,
+                peak_time_list,
                 pedestal_per_sample_list,
                 event_stat_list,
                 self.i_readed_events - 1,

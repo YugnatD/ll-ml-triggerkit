@@ -6,6 +6,117 @@ jointly. Split out of the sandbox's ``train_utils.py``; behaviour unchanged.
 """
 
 import tensorflow as tf
+from tensorflow import keras
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class PairwiseAUCLoss(tf.keras.losses.Loss):
+    """Serializable form of the pairwise-AUC loss.
+
+    A closure returned by a factory cannot be saved: Keras stores the *name*
+    ``loss`` and has nothing to rebuild it from, so a compiled model fails to
+    reload with "Could not locate function 'loss'". Holding ``sharpness`` on a
+    registered class instead makes the compiled model round-trip.
+
+    ``reduction="sum"`` is a no-op on the scalar ``call`` returns; it is set so
+    no reduction can rescale the value away from the closure's.
+    """
+
+    def __init__(self, sharpness=1.0, name="pairwise_auc", reduction="sum", **kwargs):
+        super().__init__(name=name, reduction=reduction, **kwargs)
+        self.sharpness = float(sharpness)
+
+    def call(self, y_true, y_pred):
+        s = self.sharpness
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+        pos = tf.boolean_mask(y_pred, y_true > 0.5)
+        neg = tf.boolean_mask(y_pred, y_true < 0.5)
+        n_pos = tf.size(pos)
+        n_neg = tf.size(neg)
+
+        def _pairwise():
+            diff = pos[:, None] - neg[None, :]
+            return tf.reduce_mean(tf.nn.softplus(-s * diff))
+
+        return tf.cond(
+            tf.logical_and(n_pos > 0, n_neg > 0),
+            _pairwise,
+            lambda: tf.constant(0.0, dtype=tf.float32),
+        )
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(sharpness=self.sharpness)
+        return cfg
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class PairwiseAUCLossMulti(tf.keras.losses.Loss):
+    """Serializable multi-filter pairwise-AUC loss. See ``PairwiseAUCLoss``."""
+
+    def __init__(self, sharpness=1.0, name="pairwise_auc_multi", reduction="sum", **kwargs):
+        super().__init__(name=name, reduction=reduction, **kwargs)
+        self.sharpness = float(sharpness)
+
+    def call(self, y_true, y_pred):
+        s = self.sharpness
+        y_pred = tf.cast(y_pred, tf.float32)
+        if y_pred.shape.rank == 1:
+            y_pred = y_pred[:, None]
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        pos = tf.boolean_mask(y_pred, y_true > 0.5)
+        neg = tf.boolean_mask(y_pred, y_true < 0.5)
+        n_pos = tf.shape(pos)[0]
+        n_neg = tf.shape(neg)[0]
+
+        def _pairwise():
+            diff = pos[:, None, :] - neg[None, :, :]
+            per_col = tf.reduce_mean(tf.nn.softplus(-s * diff), axis=[0, 1])
+            return tf.reduce_sum(per_col)
+
+        return tf.cond(
+            tf.logical_and(n_pos > 0, n_neg > 0),
+            _pairwise,
+            lambda: tf.constant(0.0, dtype=tf.float32),
+        )
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(sharpness=self.sharpness)
+        return cfg
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class SoftOr(tf.keras.layers.Layer):
+    """Probabilistic OR of several branches' pre-threshold scores.
+
+    Replaces a ``Lambda`` wrapping a closure: Keras refuses to deserialize a
+    Lambda holding a Python lambda (arbitrary-code-execution risk), which made
+    every soft-OR model unloadable. The gates live in the config instead.
+    """
+
+    def __init__(self, taus, temps, **kwargs):
+        super().__init__(**kwargs)
+        self.taus = [float(t) for t in taus]
+        self.temps = [float(t) for t in temps]
+
+    def call(self, scores):
+        not_fired = None
+        for s, tau, temp in zip(scores, self.taus, self.temps):
+            s = tf.cast(s, tf.float32)
+            if s.shape.rank == 1:
+                s = s[:, None]
+            p = tf.sigmoid((s - tau) * temp)
+            term = 1.0 - p
+            not_fired = term if not_fired is None else not_fired * term
+        return 1.0 - not_fired
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(taus=self.taus, temps=self.temps)
+        return cfg
+
 
 
 def make_pairwise_auc_loss(sharpness=1.0):
@@ -18,27 +129,7 @@ def make_pairwise_auc_loss(sharpness=1.0):
     ``sharpness`` controls how steeply the softplus saturates. Set so
     ``sharpness * typical_gamma_minus_NSB_gap`` is O(1).
     """
-    s = float(sharpness)
-
-    def loss(y_true, y_pred):
-        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
-        pos = tf.boolean_mask(y_pred, y_true > 0.5)
-        neg = tf.boolean_mask(y_pred, y_true < 0.5)
-        n_pos = tf.size(pos)
-        n_neg = tf.size(neg)
-
-        def _pairwise():
-            diff = pos[:, None] - neg[None, :]  # (n_pos, n_neg)
-            return tf.reduce_mean(tf.nn.softplus(-s * diff))
-
-        return tf.cond(
-            tf.logical_and(n_pos > 0, n_neg > 0),
-            _pairwise,
-            lambda: tf.constant(0.0, dtype=tf.float32),
-        )
-
-    return loss
+    return PairwiseAUCLoss(sharpness=sharpness)
 
 
 def make_pairwise_auc_loss_multi(sharpness=1.0):
@@ -51,30 +142,7 @@ def make_pairwise_auc_loss_multi(sharpness=1.0):
     on column ``f``'s weights), so the F filters train as F parallel restarts in a
     single forward/backward pass. Pick the best one after training.
     """
-    s = float(sharpness)
-
-    def loss(y_true, y_pred):
-        y_pred = tf.cast(y_pred, tf.float32)
-        if y_pred.shape.rank == 1:
-            y_pred = y_pred[:, None]
-        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-        pos = tf.boolean_mask(y_pred, y_true > 0.5)  # (n_pos, F)
-        neg = tf.boolean_mask(y_pred, y_true < 0.5)  # (n_neg, F)
-        n_pos = tf.shape(pos)[0]
-        n_neg = tf.shape(neg)[0]
-
-        def _pairwise():
-            diff = pos[:, None, :] - neg[None, :, :]            # (n_pos, n_neg, F)
-            per_col = tf.reduce_mean(tf.nn.softplus(-s * diff), axis=[0, 1])  # (F,)
-            return tf.reduce_sum(per_col)
-
-        return tf.cond(
-            tf.logical_and(n_pos > 0, n_neg > 0),
-            _pairwise,
-            lambda: tf.constant(0.0, dtype=tf.float32),
-        )
-
-    return loss
+    return PairwiseAUCLossMulti(sharpness=sharpness)
 
 
 def soft_or_scores(branch_scores, taus, temps, name="soft_or"):
@@ -104,15 +172,4 @@ def soft_or_scores(branch_scores, taus, temps, name="soft_or"):
     if not (len(branch_scores) == len(taus) == len(temps)):
         raise ValueError("branch_scores, taus and temps must have the same length.")
 
-    def _soft_or(scores):
-        not_fired = None
-        for s, tau, temp in zip(scores, taus, temps):
-            s = tf.cast(s, tf.float32)
-            if s.shape.rank == 1:
-                s = s[:, None]
-            p = tf.sigmoid((s - float(tau)) * float(temp))
-            term = 1.0 - p
-            not_fired = term if not_fired is None else not_fired * term
-        return 1.0 - not_fired
-
-    return tf.keras.layers.Lambda(_soft_or, name=name)(list(branch_scores))
+    return SoftOr(taus=taus, temps=temps, name=name)(list(branch_scores))

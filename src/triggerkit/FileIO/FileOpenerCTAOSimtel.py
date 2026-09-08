@@ -201,6 +201,8 @@ class FileOpenerCTAOSimtel:
                 dl0_list,
                 dl1_list,
                 true_image_list,
+                # simtel carries no DL1 peak_time; the consumer emits zeros
+                None,
                 pedestal_per_sample_list,
                 event_stat_list,
                 self.i_readed_events - 1,

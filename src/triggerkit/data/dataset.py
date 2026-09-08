@@ -157,14 +157,20 @@ class TriggerDataset:
             )
 
     # ------------------------------------------------------------------ #
+    #: Targets the streaming reader can emit today.
+    SUPPORTED_TARGETS = ("class", "true_image", "peak_time")
+
     def _validate_targets(self):
-        if self.targets != ("class",):
-            unsupported = [t for t in self.targets if t != "class"]
+        if "class" not in self.targets:
+            raise ValueError(
+                f"targets={self.targets!r}: 'class' is mandatory (it is the "
+                "gamma/NSB label the trigger is trained on)."
+            )
+        unsupported = [t for t in self.targets if t not in self.SUPPORTED_TARGETS]
+        if unsupported:
             raise NotImplementedError(
-                f"targets={self.targets!r}: only ('class',) is implemented. "
-                f"Auxiliary targets {unsupported} (e.g. 'true_image') require the "
-                "streaming reader to emit them -- SimTelTFDataset currently opens "
-                "files with keep_true_image=False. Wiring this is a separate step."
+                f"targets={self.targets!r}: {unsupported} not implemented. "
+                f"Supported today: {self.SUPPORTED_TARGETS}."
             )
 
     # ------------------------------------------------------------------ #
@@ -223,6 +229,8 @@ class TriggerDataset:
             gamma_n_pe_max=n_pe_max,
             gamma_n_pe_min=n_pe_min,
             gamma_skip_if_missing_n_pe=True,
+            emit_true_image=("true_image" in self.targets),
+            emit_peak_time=("peak_time" in self.targets),
             include_event_features=True,
             event_feature_keys=self.event_feature_keys,
             nsb_skip_original_events=False,

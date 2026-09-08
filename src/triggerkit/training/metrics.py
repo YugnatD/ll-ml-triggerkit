@@ -6,8 +6,10 @@ sandbox's ``train_utils.py``; behaviour unchanged.
 """
 
 import tensorflow as tf
+from tensorflow import keras
 
 
+@keras.utils.register_keras_serializable(package="triggerkit")
 class PairwiseAUCMetric(tf.keras.metrics.Metric):
     """Hard AUC: fraction of (gamma, NSB) pairs with score_gamma > score_NSB.
 
@@ -51,6 +53,7 @@ class PairwiseAUCMetric(tf.keras.metrics.Metric):
         self.total.assign(0.0)
 
 
+@keras.utils.register_keras_serializable(package="triggerkit")
 class PerFilterPairwiseAUCMetric(tf.keras.metrics.Metric):
     """Per-filter (or best-of) hard AUC for a multi-filter pooled score ``(B, F)``.
 
@@ -102,6 +105,13 @@ class PerFilterPairwiseAUCMetric(tf.keras.metrics.Metric):
     def reset_state(self):
         self.correct.assign(tf.zeros((self.n_filters,)))
         self.total.assign(0.0)
+
+    def get_config(self):
+        # n_filters sets the weight shape and column selects what result()
+        # returns; both must survive a round trip or the metric comes back wrong.
+        cfg = super().get_config()
+        cfg.update(n_filters=self.n_filters, column=self.column)
+        return cfg
 
 
 def make_per_filter_auc_metrics(n_filters):

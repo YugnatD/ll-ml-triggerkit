@@ -64,7 +64,8 @@ from setproctitle import setproctitle
 
 class AsyncFileOpenerProcess:
     def __init__(self, filepath, max_queue_size=200,
-                 waveform_level=None, keep_dl0=True, keep_dl1=True, keep_true_image=True):
+                 waveform_level=None, keep_dl0=True, keep_dl1=True,
+                 keep_true_image=True, keep_peak_time=False):
         """
         waveform_level / keep_dl0 / keep_dl1 / keep_true_image let a caller
         that only needs part of each event's payload tell the producer to
@@ -83,7 +84,8 @@ class AsyncFileOpenerProcess:
         self._sentinel = None  # value used to signal end of stream
         self._proc = mp.Process(
             target=self._producer,
-            args=(self.filepath, self._queue, waveform_level, keep_dl0, keep_dl1, keep_true_image),
+            args=(self.filepath, self._queue, waveform_level, keep_dl0,
+                  keep_dl1, keep_true_image, keep_peak_time),
             name="CTAO Async File Opener Process",
             daemon=True,
         )
@@ -91,12 +93,14 @@ class AsyncFileOpenerProcess:
         self._finished = False
 
     @staticmethod
-    def _producer(filepath, q, waveform_level=None, keep_dl0=True, keep_dl1=True, keep_true_image=True):
+    def _producer(filepath, q, waveform_level=None, keep_dl0=True,
+                  keep_dl1=True, keep_true_image=True, keep_peak_time=False):
         setproctitle("CTAO Async File Opener Process")
         try:
             for item in FileOpenerCTAO(filepath):
                 (tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
-                 true_image_list, pedestal_per_sample_list, event_stat_list, i_event) = item
+                 true_image_list, peak_time_list, pedestal_per_sample_list,
+                 event_stat_list, i_event) = item
                 # Drop whichever fields the caller said it doesn't need before
                 # they get serialized across the process boundary -- ctapipe
                 # still decodes all of them (that cost is unavoidable here),
@@ -112,8 +116,12 @@ class AsyncFileOpenerProcess:
                     dl1_list = None
                 if not keep_true_image:
                     true_image_list = None
+                if not keep_peak_time:
+                    peak_time_list = None
+
                 q.put((tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
-                       true_image_list, pedestal_per_sample_list, event_stat_list, i_event))
+                       true_image_list, peak_time_list, pedestal_per_sample_list,
+                       event_stat_list, i_event))
         finally:
             # signal completion
             q.put(None)
@@ -197,6 +205,18 @@ class SimTelTFDatasetConfig:
     gamma_skip_if_missing_n_pe: bool = True
 
     # If True, yield extra scalar features from stat_event dict
+    # Emit the simulated Cherenkov image, (P,) photo-electrons per pixel, as a
+    # feature alongside the waveform. Off by default: it costs an extra array
+    # per event on the queue, and only an auxiliary-target trainer wants it.
+    # NSB events carry an all-zero map, which is a valid target rather than a
+    # missing one.
+    emit_true_image: bool = False
+    # Emit the DL1 peak_time, (P,) samples per pixel. Note it is a DL1
+    # RECONSTRUCTION, not simulation truth, and it is meaningful only on
+    # sufficiently bright pixels: measured on SST-1M gammas, its dispersion
+    # inside an event is 0.5-3 samples on pixels above 5 pe but 13 (i.e. uniform
+    # noise) if 1-pe pixels are included. Mask it against true_image downstream.
+    emit_peak_time: bool = False
     include_event_features: bool = True
 
     # Which scalar keys to include (must exist in your stat_event dict)
@@ -268,8 +288,18 @@ class SimTelTFDataset:
 
     # ---------- Public API ----------
 
-    def dataset(self) -> tf.data.Dataset:
-        # reset global quotas each time a dataset pipeline is built
+    def _reset_quotas(self):
+        """Refill the per-label sample quotas.
+
+        Called both when the pipeline is built AND at the start of every pass
+        through the streaming generator. The second one matters: tf.data assumes
+        a dataset can be iterated more than once (a second epoch, a counting
+        pass, a callback taking a sample), but the quotas used to be filled only
+        at build time, so any second pass started already exhausted and silently
+        yielded nothing -- surfacing much later as "input ran out of data" and a
+        zero-step progress bar. Only the load_ram path was immune, because it
+        caches everything in RAM.
+        """
         self._remaining_gamma = (
             None if self.cfg.max_gamma_samples_total is None
             else int(self.cfg.max_gamma_samples_total)
@@ -278,6 +308,9 @@ class SimTelTFDataset:
             None if self.cfg.max_nsb_samples_total is None
             else int(self.cfg.max_nsb_samples_total)
         )
+
+    def dataset(self) -> tf.data.Dataset:
+        self._reset_quotas()
 
         rng = np.random.default_rng(self.cfg.seed)
 
@@ -298,6 +331,8 @@ class SimTelTFDataset:
             return ds.prefetch(tf.data.AUTOTUNE)
 
         def infinite_generator() -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
+            # every pass starts from full quotas, so the stream is re-iterable
+            self._reset_quotas()
             while True:
                 if self._quotas_exhausted():
                     break
@@ -378,6 +413,16 @@ class SimTelTFDataset:
             features = dict(features)
             features["waveform"] = wf_out
             features["pedestal"] = ped_out
+
+            # Any per-pixel truth map must follow the same permutation, or it
+            # desynchronises from the waveform. NSB carries an all-zero map so
+            # this is numerically a no-op today, but it keeps the maps correct
+            # if the roll is ever applied to gammas too.
+            for key in ("true_image", "peak_time"):
+                if key in features:
+                    m = features[key]
+                    m_rolled = tf.gather(m, roll_idx, batch_dims=1)
+                    features[key] = tf.where(is_nsb[:, None], m_rolled, m)
             return features, label
 
         return ds.map(_roll_batch, num_parallel_calls=tf.data.AUTOTUNE)
@@ -564,11 +609,12 @@ class SimTelTFDataset:
             waveform_level=self.cfg.waveform_level,
             keep_dl0=False,
             keep_dl1=False,
-            keep_true_image=False,
+            keep_true_image=bool(self.cfg.emit_true_image),
+            keep_peak_time=bool(self.cfg.emit_peak_time),
         ) as fo:
             for (
                 tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list, true_image_list,
-                pedestal_per_sample_list, event_stat_list, i_event
+                peak_time_list, pedestal_per_sample_list, event_stat_list, i_event
             ) in fo:
                 if self._quota_exhausted_label(label):
                     break
@@ -590,7 +636,10 @@ class SimTelTFDataset:
                 wf_list = wf_r0_list if self.cfg.waveform_level == "r0" else wf_r1_list
                 ped_list = pedestal_per_sample_list
 
-                for tel_id, wf, ped in zip(tel_ids_list, wf_list, ped_list):
+                ti_list = true_image_list if self.cfg.emit_true_image else None
+                pt_list = peak_time_list if self.cfg.emit_peak_time else None
+                for i_tel, (tel_id, wf, ped) in enumerate(
+                        zip(tel_ids_list, wf_list, ped_list)):
                     tel_id_i = int(tel_id)
 
                     # Gamma-only tel_id filter
@@ -617,7 +666,36 @@ class SimTelTFDataset:
                         ped = np.zeros(x.shape[1], dtype=np.float32)  # assume shape [C, P, S] -> ped per pixel
                     ped_arr = np.array(ped, dtype=np.int32)
 
-                    def make_features(wf_arr: np.ndarray, ped_vec: np.ndarray) -> Dict[str, np.ndarray]:
+                    ti_arr = None
+                    if self.cfg.emit_true_image:
+                        # NSB has no shower: an all-zero map is the right target,
+                        # not a missing one.
+                        n_pix = x.shape[1]
+                        if ti_list is not None and i_tel < len(ti_list) \
+                                and ti_list[i_tel] is not None:
+                            ti_arr = np.asarray(ti_list[i_tel], dtype=np.float32)
+                        if ti_arr is None or ti_arr.shape != (n_pix,):
+                            ti_arr = np.zeros(n_pix, dtype=np.float32)
+                        # ctapipe writes a NEGATIVE sentinel (-3 in the SST-1M
+                        # bias-curve files) when there is no simulated image, and
+                        # it has the right shape so it flows straight through.
+                        # Clamping to zero is the physical truth for NSB -- no
+                        # Cherenkov photons -- and stops the auxiliary task from
+                        # being trained to predict the sentinel on a whole class.
+                        np.maximum(ti_arr, 0.0, out=ti_arr)
+
+                    pt_arr = None
+                    if self.cfg.emit_peak_time:
+                        n_pix = x.shape[1]
+                        if pt_list is not None and i_tel < len(pt_list) \
+                                and pt_list[i_tel] is not None:
+                            pt_arr = np.asarray(pt_list[i_tel], dtype=np.float32)
+                        if pt_arr is None or pt_arr.shape != (n_pix,):
+                            pt_arr = np.zeros(n_pix, dtype=np.float32)
+
+                    def make_features(wf_arr: np.ndarray, ped_vec: np.ndarray,
+                                      ti_vec: np.ndarray = None,
+                                      pt_vec: np.ndarray = None) -> Dict[str, np.ndarray]:
                         features: Dict[str, np.ndarray] = {
                             "waveform": wf_arr,
                             "pedestal": ped_vec,
@@ -625,6 +703,12 @@ class SimTelTFDataset:
                             "n_pe": np.array(sd.get("n_pe", -1), dtype=np.float32),
                             "tel_id": np.array(tel_id_i, dtype=np.int32),
                         }
+                        if self.cfg.emit_true_image:
+                            features["true_image"] = (
+                                ti_arr if ti_vec is None else ti_vec)
+                        if self.cfg.emit_peak_time:
+                            features["peak_time"] = (
+                                pt_arr if pt_vec is None else pt_vec)
                         if self.cfg.include_event_features:
                             for k in self.cfg.event_feature_keys:
                                 v = sd.get(k, -1.0)
@@ -647,11 +731,19 @@ class SimTelTFDataset:
                         ped_aug = ped_arr
                         # print(ped_aug.shape) # (1296,)
                         # print(wf_aug.shape)  # (1,1296,50) -> (batch, pixels, samples)
+                        ti_aug, pt_aug = ti_arr, pt_arr
                         for i in range(n):
                             wf_aug = np.roll(wf_aug, shift=1, axis=int(self.cfg.nsb_roll_axis)).copy()
                             ped_aug = np.roll(ped_aug, shift=1, axis=0).copy()
+                            # the truth map must follow the pixels, otherwise it
+                            # desynchronises from the waveform as soon as the
+                            # augmentation is on
+                            if ti_aug is not None:
+                                ti_aug = np.roll(ti_aug, shift=1, axis=0).copy()
+                            if pt_aug is not None:
+                                pt_aug = np.roll(pt_aug, shift=1, axis=0).copy()
                             if self._consume_quota(label):
-                                yield make_features(wf_aug, ped_aug), y
+                                yield make_features(wf_aug, ped_aug, ti_aug, pt_aug), y
                             else:
                                 break
 
@@ -666,6 +758,10 @@ class SimTelTFDataset:
             "event_id": tf.TensorSpec(shape=(), dtype=tf.int64),
             "tel_id": tf.TensorSpec(shape=(), dtype=tf.int32),
         }
+        if self.cfg.emit_true_image:
+            feat["true_image"] = tf.TensorSpec(shape=(None,), dtype=tf.float32)
+        if self.cfg.emit_peak_time:
+            feat["peak_time"] = tf.TensorSpec(shape=(None,), dtype=tf.float32)
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat[k] = tf.TensorSpec(shape=(), dtype=tf.float32)
@@ -680,6 +776,10 @@ class SimTelTFDataset:
             "event_id": [],
             "tel_id": [],
         }
+        if self.cfg.emit_true_image:
+            feat_shapes["true_image"] = [None]
+        if self.cfg.emit_peak_time:
+            feat_shapes["peak_time"] = [None]
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat_shapes[k] = []
@@ -693,6 +793,10 @@ class SimTelTFDataset:
             "event_id": tf.constant(-1, tf.int64),
             "tel_id": tf.constant(-1, tf.int32),
         }
+        if self.cfg.emit_true_image:
+            feat_vals["true_image"] = tf.constant(0.0, tf.float32)
+        if self.cfg.emit_peak_time:
+            feat_vals["peak_time"] = tf.constant(0.0, tf.float32)
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat_vals[k] = tf.constant(0.0, tf.float32)
