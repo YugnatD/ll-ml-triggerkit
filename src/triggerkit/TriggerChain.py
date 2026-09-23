@@ -1131,10 +1131,39 @@ class TriggerChain:
     if not expects_baseline:
         print("Model expects 1 input; using waveform only (ignoring pedestal).")
 
+    def edge_hold_shift(wf, shift):
+        """Shift ``wf`` (B,P,S) along the time axis by ``shift`` samples (static
+        python int), filling the vacated region with a REPEAT of that trace's own
+        boundary sample -- not a circular wrap, not a flat constant.
+
+        A circular roll splices the (usually unrelated) tail onto the front; a
+        flat/median fill glues in a value disconnected from the real edge sample.
+        Both manufacture a fake edge sharp enough for TDSCAN's differencing
+        kernel to fire on: measured on real NSB, roll/median-fill inflate the
+        trigger rate ~20-25x at a frozen tau (46 kHz -> ~1-1.2 MHz for shift=5).
+        Repeating the boundary sample instead has ZERO derivative where it's
+        inserted, so the kernel sees nothing there; measured rate at shift=5 is
+        45 kHz, indistinguishable from unshifted (46 kHz). See [[tdscan-edge-blindspot]].
+        """
+        if shift == 0:
+            return wf
+        # Tile has no uint16 kernel on this TF build (raises UnimplementedError
+        # at run time, not at trace time) -- do the tile/concat in int32.
+        dtype = wf.dtype
+        wf32 = tf.cast(wf, tf.int32)
+        if shift > 0:
+            pad = tf.tile(wf32[:, :, 0:1], [1, 1, shift])
+            out = tf.concat([pad, wf32[:, :, :-shift]], axis=2)
+        else:
+            s = -shift
+            pad = tf.tile(wf32[:, :, -1:], [1, 1, s])
+            out = tf.concat([wf32[:, :, s:], pad], axis=2)
+        return tf.cast(out, dtype)
+
     def make_pack(reindex, gi, ni, gts=0, nts=0):
         """Build the tf.data map fn for one fold (closes over its reindexing).
 
-        ``gts`` / ``nts`` are per-class circular time-sample rolls of the
+        ``gts`` / ``nts`` are per-class edge-hold time-sample shifts of the
         waveform (gamma / NSB); 0 = none. They move the pulse in time to test
         whether the model leaked the absolute temporal position of the gamma.
         """
@@ -1157,13 +1186,13 @@ class TriggerChain:
                 wf  = tf.gather(wf, sel, batch_dims=1)
                 ped = tf.gather(ped, sel, batch_dims=1)
 
-            # Per-class temporal roll (waveform only -- the pedestal has no time
-            # axis). Circular roll along the sample axis; gammas by gts, NSB by
-            # nts. Leaves the pedestal untouched.
+            # Per-class temporal shift (waveform only -- the pedestal has no
+            # time axis). Edge-hold along the sample axis (see
+            # edge_hold_shift); gammas by gts, NSB by nts.
             if time_roll:
                 is_g = tf.equal(y, 1)[:, None, None]                # (B,1,1)
-                wf_g = tf.roll(wf, shift=gts, axis=2) if gts else wf
-                wf_n = tf.roll(wf, shift=nts, axis=2) if nts else wf
+                wf_g = edge_hold_shift(wf, gts)
+                wf_n = edge_hold_shift(wf, nts)
                 wf = tf.where(is_g, wf_g, wf_n)
 
             extra = {
@@ -2054,12 +2083,27 @@ class TriggerChain:
     # 3. Build waveform list per stage
     #    wf_list_result[stage][tel] has shape (n_pixels, n_samples)
     # --------------------------------------------------------------
-    # Optional temporal augmentation: circularly roll the raw waveform on the
-    # sample axis, exactly like the gamma_time_shift CV fold (tf.roll axis=S).
+    # Optional temporal augmentation: edge-hold shift the raw waveform on the
+    # sample axis, exactly like the gamma_time_shift CV fold (see
+    # compute_statistics's edge_hold_shift). NOT a circular roll: the vacated
+    # region is filled with a repeat of that pixel's own boundary sample, not
+    # the wrapped-in tail -- a circular roll manufactures a fake edge sharp
+    # enough to fire TDSCAN's differencing kernel (measured ~20-25x NSB rate
+    # inflation at shift=5; see [[tdscan-edge-blindspot]]).
     # Applied before any stage so every displayed stage sees the shifted pulse.
     if time_roll:
-        wf_list_telescope = [np.roll(wf, int(time_roll), axis=1) for wf in wf_list_telescope]
-        print(f"Applied time_roll={int(time_roll)} sample(s) to the raw waveform.")
+        shift = int(time_roll)
+        def _edge_hold_shift_np(wf, shift):
+            if shift == 0:
+                return wf
+            if shift > 0:
+                pad = np.repeat(wf[:, 0:1], shift, axis=1)
+                return np.concatenate([pad, wf[:, :-shift]], axis=1)
+            s = -shift
+            pad = np.repeat(wf[:, -1:], s, axis=1)
+            return np.concatenate([wf[:, s:], pad], axis=1)
+        wf_list_telescope = [_edge_hold_shift_np(wf, shift) for wf in wf_list_telescope]
+        print(f"Applied edge-hold time shift={shift} sample(s) to the raw waveform.")
 
     wf_list_result = [wf_list_telescope]
 
