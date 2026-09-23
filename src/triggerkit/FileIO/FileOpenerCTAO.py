@@ -1,165 +1,24 @@
 from __future__ import annotations
 
 import os
-import enum
 import numpy as np
-import multiprocessing as mp
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import tensorflow as tf
 
-from triggerkit.FileIO.FileOpenerCTAOHDF5 import FileOpenerCTAOHDF5
-from triggerkit.FileIO.FileOpenerCTAOSimtel import FileOpenerCTAOSimtel
-
-class FileType(enum.Enum):
-    SIMTEL = 1  # .simtel.gz files
-    H5 = 2  # .h5 files
-
-
-class FileOpenerCTAO:
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.file_type = self._detect_file_type(filepath)
-        if self.file_type == FileType.SIMTEL:
-            self._impl = FileOpenerCTAOSimtel(filepath)
-        elif self.file_type == FileType.H5:
-            self._impl = FileOpenerCTAOHDF5(filepath)
-        else:
-            raise ValueError("Unsupported file format.")
-
-    @staticmethod
-    def _detect_file_type(filepath: str) -> FileType:
-        if filepath.endswith(".simtel.gz") or filepath.endswith(".simtel"):  # compressed or uncompressed
-            return FileType.SIMTEL
-        if filepath.endswith(".h5") or filepath.endswith(".hdf5"):
-            return FileType.H5
-        return None
-
-    def __getattr__(self, name):
-        return getattr(self._impl, name)
-
-    def __enter__(self):
-        self._impl.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return self._impl.__exit__(exc_type, exc_value, traceback)
-
-    def _open(self):
-        return self._impl._open()
-
-    def _close(self):
-        return self._impl._close()
-
-    def __iter__(self):
-        self._impl.__iter__()
-        return self
-
-    def __next__(self):
-        return next(self._impl)
-
-
-from setproctitle import setproctitle
-
-class AsyncFileOpenerProcess:
-    def __init__(self, filepath, max_queue_size=200,
-                 waveform_level=None, keep_dl0=True, keep_dl1=True,
-                 keep_true_image=True, keep_peak_time=False):
-        """
-        waveform_level / keep_dl0 / keep_dl1 / keep_true_image let a caller
-        that only needs part of each event's payload tell the producer to
-        drop the rest BEFORE it's pickled through the Queue, instead of
-        paying to serialize and transfer arrays the consumer immediately
-        discards. Defaults keep everything (unchanged behavior) since
-        AsyncFileOpenerProcess is shared by several consumers with different
-        needs -- e.g. TriggerChain._iter_samples wants both waveform levels
-        plus true_image, TriggerChain's event-finder wants dl0/dl1 too. Only
-        SimTelTFDataset (which knows it wants exactly one waveform_level and
-        never touches dl0/dl1/true_image) opts into trimming.
-        """
-        # print(f"Starting AsyncFileOpenerProcess for {filepath}")
-        self.filepath = filepath
-        self._queue = mp.Queue(maxsize=max_queue_size)
-        self._sentinel = None  # value used to signal end of stream
-        self._proc = mp.Process(
-            target=self._producer,
-            args=(self.filepath, self._queue, waveform_level, keep_dl0,
-                  keep_dl1, keep_true_image, keep_peak_time),
-            name="CTAO Async File Opener Process",
-            daemon=True,
-        )
-        self._proc.start()
-        self._finished = False
-
-    @staticmethod
-    def _producer(filepath, q, waveform_level=None, keep_dl0=True,
-                  keep_dl1=True, keep_true_image=True, keep_peak_time=False):
-        setproctitle("CTAO Async File Opener Process")
-        try:
-            for item in FileOpenerCTAO(filepath):
-                (tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
-                 true_image_list, peak_time_list, pedestal_per_sample_list,
-                 event_stat_list, i_event) = item
-                # Drop whichever fields the caller said it doesn't need before
-                # they get serialized across the process boundary -- ctapipe
-                # still decodes all of them (that cost is unavoidable here),
-                # but this avoids pickling/transferring arrays that would be
-                # thrown away on the other side of the queue.
-                if waveform_level == "r0":
-                    wf_r1_list = None
-                elif waveform_level == "r1":
-                    wf_r0_list = None
-                if not keep_dl0:
-                    dl0_list = None
-                if not keep_dl1:
-                    dl1_list = None
-                if not keep_true_image:
-                    true_image_list = None
-                if not keep_peak_time:
-                    peak_time_list = None
-
-                q.put((tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
-                       true_image_list, peak_time_list, pedestal_per_sample_list,
-                       event_stat_list, i_event))
-        finally:
-            # signal completion
-            q.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._finished:
-            raise StopIteration
-
-        item = self._queue.get()
-        if item is self._sentinel:
-            # make sure background process has terminated
-            if self._proc.is_alive():
-                self._proc.join()
-            self._finished = True
-            raise StopIteration
-
-        return item
-    
-    def close(self):
-        """Explicitly clean up the child process."""
-        if self._proc.is_alive():
-            self._proc.terminate()
-        self._proc.join()
-        # Don't let the Queue's background feeder thread try to flush
-        # whatever was left buffered when we just terminated the producer;
-        # release the pipe/semaphore now instead of waiting on GC/atexit.
-        self._queue.close()
-        self._queue.cancel_join_thread()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
+# FileType / FileOpenerCTAO / AsyncFileOpenerProcess live in their own,
+# TensorFlow-free module -- see AsyncFileOpener.py's docstring for why (short
+# version: AsyncFileOpenerProcess must spawn, not fork, its worker processes
+# to avoid a fork-after-CUDA-init hang, and spawning from a module that
+# imports tensorflow at top level would re-pay a full TF+CUDA init in every
+# spawned worker). Re-exported here since most of the codebase imports them
+# from this module.
+from triggerkit.FileIO.AsyncFileOpener import (  # noqa: F401
+    FileType,
+    FileOpenerCTAO,
+    AsyncFileOpenerProcess,
+)
 
 
 @dataclass

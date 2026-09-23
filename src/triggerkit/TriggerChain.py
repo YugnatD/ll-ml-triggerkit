@@ -4,6 +4,7 @@ import time
 import csv
 import pickle
 import signal
+import multiprocessing as mp
 import numpy as np
 import builtins
 
@@ -1078,34 +1079,36 @@ class TriggerChain:
     # condition -- low/medium/... -- simulated independently, not a permutation
     # of one fixed dataset; see augment.make_condition_folds). None = use this
     # chain's own self.simtel_path / self.simtel_nsb_path, as before.
+    #
+    # Each fold also carries its OWN gamma/NSB event budget (augment.py REQUIRES
+    # every fold spec to set these explicitly -- no implicit total/n_folds
+    # split), falling back to this call's own max_gamma_events/max_nsb_events
+    # only for the folds=None single-pass case or a Fold built without one.
     if folds is None:
-        fold_plan = [("all", None, None, {}, 0, 0, None, None)]
+        fold_plan = [("all", None, None, {}, 0, 0, None, None, max_gamma_events, max_nsb_events)]
     else:
         fold_plan = [(f.name, f.gamma_index, f.nsb_index, getattr(f, "config", {}),
                       int(getattr(f, "gamma_time_shift", 0)),
                       int(getattr(f, "nsb_time_shift", 0)),
-                      getattr(f, "gamma_files", None), getattr(f, "nsb_files", None))
+                      getattr(f, "gamma_files", None), getattr(f, "nsb_files", None),
+                      getattr(f, "max_gamma_events", None) if getattr(f, "max_gamma_events", None) is not None else max_gamma_events,
+                      getattr(f, "max_nsb_events", None) if getattr(f, "max_nsb_events", None) is not None else max_nsb_events)
                      for f in folds]
         print(f"Cross-validation: {len(fold_plan)} folds -> "
               f"{[name for name, *_ in fold_plan]}")
 
-    # Optional per-fold event caps. Each fold rebuilds the dataset (the opener
-    # resets its per-label quota on every dataset() build), so these bound the
-    # gamma / NSB events processed *in each fold* -- e.g. max_gamma_events=50_000,
-    # max_nsb_events=100_000 gives every fold at most 50k gammas + 100k NSB.
-    # None = no cap (use all available events). The gamma count is measured after
-    # the tel_id_only filter; the NSB count is source events (with augmentation
-    # off, that is exactly the NSB events seen).
-    cfg = SimTelTFDatasetConfig(
-        max_gamma_samples_total=max_gamma_events,
-        max_nsb_samples_total=max_nsb_events,
+    # Shared SimTelTFDatasetConfig kwargs -- everything EXCEPT the per-group
+    # event caps (max_gamma_samples_total/max_nsb_samples_total), which are
+    # filled in per group below from the folds sharing that group's source
+    # (see the group loop).
+    base_cfg_kwargs = dict(
         batch_size=batch_size,
         shuffle_samples=False,
         sample_shuffle_buffer=10000,
         seed=1337,
         load_ram=False, # too much data to load in ram
         interleave_files=True,
-        waveform_level="r0", 
+        waveform_level="r0",
         gamma_tel_id_only=tel_id_only,
         # Evaluate on everything
         gamma_n_pe_max=None,
@@ -1160,52 +1163,56 @@ class TriggerChain:
             out = tf.concat([wf32[:, :, s:], pad], axis=2)
         return tf.cast(out, dtype)
 
-    def make_pack(reindex, gi, ni, gts=0, nts=0):
-        """Build the tf.data map fn for one fold (closes over its reindexing).
-
-        ``gts`` / ``nts`` are per-class edge-hold time-sample shifts of the
-        waveform (gamma / NSB); 0 = none. They move the pulse in time to test
-        whether the model leaked the absolute temporal position of the gamma.
+    def base_pack(features, label):
+        """Decode ONE raw batch (dtype casts/reshapes, scalar extras) --
+        shared by every fold that reads the same source files. Fold-specific
+        reindex/time-shift is applied afterwards, per fold, by
+        apply_fold_transform -- splitting it out of this step is what lets
+        several folds share a single read+decode pass over the same data
+        instead of each re-streaming the files independently.
         """
-        time_roll = bool(gts or nts)
-        def pack(features, label):
-            wf  = tf.cast(features["waveform"], tf.uint16)
-            ped = tf.cast(features["pedestal"], tf.int32)
+        wf  = tf.cast(features["waveform"], tf.uint16)
+        ped = tf.cast(features["pedestal"], tf.int32)
 
-            wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
-            ped = tf.reshape(ped, (-1, self.num_pixels))
+        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
+        ped = tf.reshape(ped, (-1, self.num_pixels))
 
-            y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
+        y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
 
-            # Per-class pixel reindex for a cross-validation fold: pick the gamma
-            # permutation on gamma rows and the NSB one on NSB rows, then gather
-            # the same indices from both waveform and pedestal (the baseline
-            # rotates with the camera).
-            if reindex:
-                sel = tf.where(tf.equal(y, 1)[:, None], gi[None, :], ni[None, :])  # (B, P)
-                wf  = tf.gather(wf, sel, batch_dims=1)
-                ped = tf.gather(ped, sel, batch_dims=1)
+        extra = {
+            "event_id": tf.reshape(tf.cast(features["event_id"], tf.int64), (-1,)),
+            "tel_id":   tf.reshape(tf.cast(features["tel_id"], tf.int32), (-1,)),
+            "n_pe":     tf.reshape(tf.cast(features["n_pe"], tf.float32), (-1,)),
+        }
+        for key in STATS_EVENT_FLOAT_KEYS:
+            extra[key] = tf.reshape(tf.cast(features[key], tf.float32), (-1,))
+        return wf, ped, y, extra
 
-            # Per-class temporal shift (waveform only -- the pedestal has no
-            # time axis). Edge-hold along the sample axis (see
-            # edge_hold_shift); gammas by gts, NSB by nts.
-            if time_roll:
-                is_g = tf.equal(y, 1)[:, None, None]                # (B,1,1)
-                wf_g = edge_hold_shift(wf, gts)
-                wf_n = edge_hold_shift(wf, nts)
-                wf = tf.where(is_g, wf_g, wf_n)
+    def apply_fold_transform(wf, ped, y, reindex, gi, ni, gts, nts):
+        """One fold's own reindex + edge-hold time-shift, applied to a batch
+        already decoded by base_pack. Same ops as the old fused pack(), just
+        moved out of the tf.data .map() so they can run once per fold against
+        a SHARED decoded batch instead of once per fold's own separate read.
+        """
+        # Per-class pixel reindex for a cross-validation fold: pick the gamma
+        # permutation on gamma rows and the NSB one on NSB rows, then gather
+        # the same indices from both waveform and pedestal (the baseline
+        # rotates with the camera).
+        if reindex:
+            sel = tf.where(tf.equal(y, 1)[:, None], gi[None, :], ni[None, :])  # (B, P)
+            wf  = tf.gather(wf, sel, batch_dims=1)
+            ped = tf.gather(ped, sel, batch_dims=1)
 
-            extra = {
-                "event_id": tf.reshape(tf.cast(features["event_id"], tf.int64), (-1,)),
-                "tel_id":   tf.reshape(tf.cast(features["tel_id"], tf.int32), (-1,)),
-                "n_pe":     tf.reshape(tf.cast(features["n_pe"], tf.float32), (-1,)),
-            }
-            for key in STATS_EVENT_FLOAT_KEYS:
-                extra[key] = tf.reshape(tf.cast(features[key], tf.float32), (-1,))
-            if expects_baseline:
-                return (wf, ped), y, extra
-            return wf, y, extra
-        return pack
+        # Per-class temporal shift (waveform only -- the pedestal has no
+        # time axis). Edge-hold along the sample axis (see edge_hold_shift);
+        # gammas by gts, NSB by nts.
+        if gts or nts:
+            is_g = tf.equal(y, 1)[:, None, None]                # (B,1,1)
+            wf_g = edge_hold_shift(wf, gts)
+            wf_n = edge_hold_shift(wf, nts)
+            wf = tf.where(is_g, wf_g, wf_n)
+
+        return wf, ped
 
     # --- One-time setup (shared by every fold) -------------------------------
     # Use the last TrainableThreshold layer when several thresholds exist -- but
@@ -1246,12 +1253,14 @@ class TriggerChain:
     # Graceful Ctrl+C: finish current batch then discard partial stats.
     stop_flags = {"requested": False, "interrupted": False}
     previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def _request_stop(signum, frame):
         if stop_flags["requested"]:
-            print("\nCtrl+C pressed again; exiting immediately.")
+            print("\nSignal received again; exiting immediately.")
             raise KeyboardInterrupt
-        print("\nCtrl+C detected: will stop after current batch and delete partial statistics file...")
+        label = "Ctrl+C" if signum == signal.SIGINT else "SIGTERM"
+        print(f"\n{label} detected: will stop after current batch and delete partial statistics file...")
         stop_flags["requested"] = True
 
     # check if the file already exists
@@ -1277,50 +1286,96 @@ class TriggerChain:
     if threshold_layer is not None:
         writer.f.attrs[PRE_THRESHOLD_COMPARISON_ATTR] = getattr(threshold_layer, "comparison", "gt")
     signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
 
     trig_rate = None
     all_stats = {}          # per-fold stats dict, keyed by fold name
     total_events = 0
 
     try:
-        # Each fold is a full independent pass over the data, streamed into the
-        # same writer under its own fold index (all folds share one HDF5 file).
-        for fold_name, gamma_idx, nsb_idx, fold_cfg, gts, nts, fold_gamma_files, fold_nsb_files in fold_plan:
-            reindex = gamma_idx is not None or nsb_idx is not None
-            if reindex:
-                gi = tf.constant(
-                    np.arange(self.num_pixels) if gamma_idx is None else np.asarray(gamma_idx),
-                    dtype=tf.int32)
-                ni = tf.constant(
-                    np.arange(self.num_pixels) if nsb_idx is None else np.asarray(nsb_idx),
-                    dtype=tf.int32)
-                extra_msg = f", time_roll g={gts}/n={nts}" if (gts or nts) else ""
-                print(f"\n=== fold '{fold_name}' (reindex active, P={self.num_pixels}{extra_msg}) ===")
-            else:
-                gi = ni = None
-                if gts or nts:
-                    print(f"\n=== fold '{fold_name}' (time_roll g={gts}/n={nts}) ===")
-                else:
-                    print(f"\n=== fold '{fold_name}' ===")
+        # Group folds that read the IDENTICAL (gamma_files, nsb_files) source
+        # -- e.g. all rotation/time-shift folds, which only permute pixels or
+        # shift time on top of the chain's own reference-condition data -- so
+        # that source is streamed and decoded from disk ONCE per group,
+        # instead of once per fold. Model inference still runs once per fold
+        # per batch (each fold's reindex/shift can change the score), so this
+        # saves I/O/decoding/subprocess overhead, not model compute -- but
+        # I/O (ctapipe decoding, multiprocessing queues, one subprocess spawn
+        # per file opened) was the dominant cost, not TDSCAN's own tiny
+        # forward pass. A fold with its own override files (e.g. an NSB
+        # condition fold from augment.make_condition_folds) still gets its
+        # own group/pass, since its data is genuinely different.
+        groups = {}  # (gamma_files_tuple, nsb_files_tuple) -> list of fold_plan entries
+        group_order = []
+        for entry in fold_plan:
+            _, _, _, _, _, _, fold_gamma_files, fold_nsb_files, _, _ = entry
+            key = (
+                tuple(fold_gamma_files if fold_gamma_files is not None else self.simtel_path),
+                tuple(fold_nsb_files if fold_nsb_files is not None else self.simtel_nsb_path),
+            )
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(entry)
 
-            writer.begin_fold(fold_name, fold_cfg)
+        def new_accum(gamma_cap, nsb_cap):
+            return {
+                "gamma_total": 0, "gamma_trig": 0, "nsb_total": 0, "nsb_trig": 0,
+                "gamma_score_chunks": [], "nsb_score_chunks": [], "roc_auc": float("nan"),
+                "gamma_cap": gamma_cap, "nsb_cap": nsb_cap,
+            }
 
-            print("Computing statistics with current model...")
-            resolved_gamma_files = fold_gamma_files if fold_gamma_files is not None else self.simtel_path
-            resolved_nsb_files = fold_nsb_files if fold_nsb_files is not None else self.simtel_nsb_path
-            # Always print WHICH files this fold actually reads -- a rotation
-            # fold (gamma_idx/nsb_idx set, gamma_files/nsb_files None) silently
-            # falls back to the chain's own (reference-condition) files, while a
-            # condition fold (see augment.make_condition_folds) overrides them
-            # with a different, independently-simulated dataset. Without this,
-            # e.g. "low" vs "medium" NSB is indistinguishable from the fold name
-            # alone in the progress log.
-            _n_gamma = len(resolved_gamma_files) if resolved_gamma_files else 0
-            print(f"    fold '{fold_name}' source: gamma={_n_gamma} file(s)"
+        def _cap_met(total, cap):
+            return cap is not None and total >= cap
+
+        for group_key in group_order:
+            entries = groups[group_key]
+            resolved_gamma_files, resolved_nsb_files = (list(g) for g in group_key)
+            names_in_group = [e[0] for e in entries]
+
+            # This group's dataset-level cap is the LARGEST budget among its
+            # folds (None/uncapped wins if any fold in the group has no cap):
+            # the shared read must run at least as long as whichever fold in
+            # the group needs the most events; folds with a smaller budget of
+            # their own just stop accumulating earlier (see _cap_met below),
+            # not by ending the shared read sooner.
+            fold_gcaps = [e[8] for e in entries]
+            fold_ncaps = [e[9] for e in entries]
+            group_gamma_cap = None if any(c is None for c in fold_gcaps) else max(fold_gcaps)
+            group_nsb_cap = None if any(c is None for c in fold_ncaps) else max(fold_ncaps)
+            cfg = SimTelTFDatasetConfig(
+                max_gamma_samples_total=group_gamma_cap,
+                max_nsb_samples_total=group_nsb_cap,
+                **base_cfg_kwargs,
+            )
+
+            print(f"\n=== group [{', '.join(names_in_group)}] "
+                  f"({len(entries)} fold(s) sharing one read pass; "
+                  f"group budget gamma={group_gamma_cap}, nsb={group_nsb_cap}) ===")
+            _n_gamma = len(resolved_gamma_files)
+            print(f"    source: gamma={_n_gamma} file(s)"
                   + (f" [{resolved_gamma_files[0]}, ...]" if _n_gamma else "")
-                  + f", nsb={resolved_nsb_files}"
-                  + ("" if fold_gamma_files is not None or fold_nsb_files is not None
-                     else " (chain default)"))
+                  + f", nsb={resolved_nsb_files}")
+
+            # Register every fold in the group up front and precompute its own
+            # (reindex, gi, ni, gts, nts) once -- reused every batch below.
+            fold_setup = []  # (fold_name, fold_idx, reindex, gi, ni, gts, nts)
+            accum = {}
+            for fold_name, gamma_idx, nsb_idx, fold_cfg, gts, nts, _, _, gcap, ncap in entries:
+                fold_idx = writer.begin_fold(fold_name, fold_cfg)
+                accum[fold_name] = new_accum(gcap, ncap)
+                reindex = gamma_idx is not None or nsb_idx is not None
+                if reindex:
+                    gi = tf.constant(
+                        np.arange(self.num_pixels) if gamma_idx is None else np.asarray(gamma_idx),
+                        dtype=tf.int32)
+                    ni = tf.constant(
+                        np.arange(self.num_pixels) if nsb_idx is None else np.asarray(nsb_idx),
+                        dtype=tf.int32)
+                else:
+                    gi = ni = None
+                fold_setup.append((fold_name, fold_idx, reindex, gi, ni, gts, nts))
+
             stats_dataset = SimTelTFDataset(
                 gamma_files=resolved_gamma_files,
                 nsb_files=resolved_nsb_files,
@@ -1328,87 +1383,111 @@ class TriggerChain:
                 config=cfg
             )
             ds = (stats_dataset.dataset()
-                  .map(make_pack(reindex, gi, ni, gts, nts), num_parallel_calls=tf.data.AUTOTUNE)
+                  .map(base_pack, num_parallel_calls=tf.data.AUTOTUNE)
                   .prefetch(tf.data.AUTOTUNE))
 
-            # Per-fold accumulators.
-            gamma_total = gamma_trig = nsb_total = nsb_trig = 0
-            gamma_eff = 0.0
-            nsb_rate_hz = 0.0
-            # Live gamma-vs-NSB ROC AUC (Mann-Whitney) of the pre-threshold score:
-            # the same quantity the training loss optimizes and the report shows.
-            gamma_score_chunks = []
-            nsb_score_chunks = []
-            roc_auc = float("nan")
-
-            for i_batch, (inp, y, extra) in enumerate(ds):
-                p = self.model(inp, training=False)
-                p = tf.reshape(tf.cast(p, tf.float32), (-1,))
-                pre_threshold_score_np = None
-                trigger_ref_np = None
-
-                if threshold_layer is not None:
-                    score_tensor = getattr(threshold_layer, "last_score", None)
-                    if score_tensor is not None:
-                        score_tensor = self._collapse_scores_to_event_scores(score_tensor)
-                        pre_threshold_score_np = score_tensor.numpy().astype(np.float32)
-                        if tau is not None:
-                            if hasattr(threshold_layer, "hard_decision"):
-                                trigger_ref_np = threshold_layer.hard_decision(
-                                    pre_threshold_score_np
-                                ).numpy().astype(np.uint8)
-                            else:
-                                trigger_ref_np = (pre_threshold_score_np > float(tau)).astype(np.uint8)
-
-                if trigger_ref_np is None:
-                    trigger_ref_np = (p.numpy() > 0.5).astype(np.uint8)
-
-                # pull to numpy once/batch
+            group_events = 0
+            for i_batch, (wf0, ped0, y, extra) in enumerate(ds):
                 y_np = y.numpy().astype(np.uint8)
+                group_events += len(y_np)
                 total_events += len(y_np)
                 n_pe_np = extra["n_pe"].numpy().astype(np.float32)
-
-                # Gamma statistics (label=1)
+                event_id_np = extra["event_id"].numpy().astype(np.int64)
+                tel_id_np = extra["tel_id"].numpy().astype(np.int32)
+                extra_np = {key: extra[key].numpy().astype(np.float32) for key in STATS_EVENT_FLOAT_KEYS}
                 gamma_mask = y_np == 1
-                gamma_total += np.sum(gamma_mask)
-                gamma_trig += np.sum(trigger_ref_np[gamma_mask] > 0)
-
-                # NSB statistics (label=0)
                 nsb_mask = y_np == 0
-                nsb_total += np.sum(nsb_mask)
-                nsb_trig += np.sum(trigger_ref_np[nsb_mask] > 0)
 
-                # Accumulate per-class pre-threshold scores for the live ROC AUC.
-                if pre_threshold_score_np is not None:
-                    gamma_score_chunks.append(pre_threshold_score_np[gamma_mask])
-                    nsb_score_chunks.append(pre_threshold_score_np[nsb_mask])
+                for fold_name, fold_idx, reindex, gi, ni, gts, nts in fold_setup:
+                    st = accum[fold_name]
+                    # This fold already has all the events its OWN budget asks
+                    # for (gamma AND nsb) -- skip its work for this batch while
+                    # the shared read keeps going for siblings that still need
+                    # more.
+                    gamma_done = _cap_met(st["gamma_total"], st["gamma_cap"])
+                    nsb_done = _cap_met(st["nsb_total"], st["nsb_cap"])
+                    if gamma_done and nsb_done:
+                        continue
+                    # Independent per-class gating: gamma_events/nsb_events can
+                    # differ a lot for the same fold (e.g. a fold only after
+                    # more NSB stats), so a class that's already satisfied must
+                    # stop contributing on its own, not just when BOTH are done
+                    # -- otherwise it would keep overshooting every batch until
+                    # the slower class finally catches up.
+                    keep_mask = np.ones(len(y_np), dtype=bool)
+                    if gamma_done:
+                        keep_mask &= ~gamma_mask
+                    if nsb_done:
+                        keep_mask &= ~nsb_mask
 
-                cols = {
-                    "label":     y_np,                                  # 1 gamma / 0 nsb
-                    "event_id":  extra["event_id"].numpy().astype(np.int64),
-                    "tel_id":    extra["tel_id"].numpy().astype(np.int32),
-                    "n_pe":      n_pe_np,
-                    "p_trig":    p.numpy().astype(np.float32),
-                }
-                for key in STATS_EVENT_FLOAT_KEYS:
-                    cols[key] = extra[key].numpy().astype(np.float32)
-                if pre_threshold_score_np is not None:
-                    cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np
-                writer.append(cols)
+                    wf, ped = apply_fold_transform(wf0, ped0, y, reindex, gi, ni, gts, nts)
+                    inp = (wf, ped) if expects_baseline else wf
+                    p = self.model(inp, training=False)
+                    p = tf.reshape(tf.cast(p, tf.float32), (-1,))
+                    pre_threshold_score_np = None
+                    trigger_ref_np = None
 
-                # Calculate current statistics
-                gamma_eff = gamma_trig / gamma_total if gamma_total > 0 else 0.0
-                nsb_rate_hz = (nsb_trig / nsb_total / self.window_size) if nsb_total > 0 else 0.0
-                # Recompute the exact ROC AUC periodically (cheap, and once at end).
-                if gamma_score_chunks and nsb_score_chunks and (i_batch % 20 == 0):
-                    roc_auc = roc_auc_mann_whitney(
-                        np.concatenate(gamma_score_chunks), np.concatenate(nsb_score_chunks)
-                    )
-                auc_txt = f"{roc_auc*100:.2f}%" if np.isfinite(roc_auc) else "NA"
+                    if threshold_layer is not None:
+                        score_tensor = getattr(threshold_layer, "last_score", None)
+                        if score_tensor is not None:
+                            score_tensor = self._collapse_scores_to_event_scores(score_tensor)
+                            pre_threshold_score_np = score_tensor.numpy().astype(np.float32)
+                            if tau is not None:
+                                if hasattr(threshold_layer, "hard_decision"):
+                                    trigger_ref_np = threshold_layer.hard_decision(
+                                        pre_threshold_score_np
+                                    ).numpy().astype(np.uint8)
+                                else:
+                                    trigger_ref_np = (pre_threshold_score_np > float(tau)).astype(np.uint8)
 
-                print(f"[fold {fold_name}] batch {i_batch+1}, total events so far: {total_events}")
-                print(f"Current gamma trig/total: {gamma_trig}/{gamma_total} => {gamma_eff*100:.2f}%  | AUC(gamma vs NSB) => {auc_txt}")
-                print(f"Current NSB rate (hard): {nsb_trig}/{nsb_total}  NSB Rate => {nsb_rate_hz:.1f} Hz")
+                    if trigger_ref_np is None:
+                        trigger_ref_np = (p.numpy() > 0.5).astype(np.uint8)
+
+                    if not keep_mask.any():
+                        continue
+                    gm = gamma_mask & keep_mask
+                    nm = nsb_mask & keep_mask
+                    p_np = p.numpy().astype(np.float32)
+
+                    st["gamma_total"] += int(np.sum(gm))
+                    st["gamma_trig"] += int(np.sum(trigger_ref_np[gm] > 0))
+                    st["nsb_total"] += int(np.sum(nm))
+                    st["nsb_trig"] += int(np.sum(trigger_ref_np[nm] > 0))
+
+                    if pre_threshold_score_np is not None:
+                        st["gamma_score_chunks"].append(pre_threshold_score_np[gm])
+                        st["nsb_score_chunks"].append(pre_threshold_score_np[nm])
+
+                    cols = {
+                        "label":     y_np[keep_mask],
+                        "event_id":  event_id_np[keep_mask],
+                        "tel_id":    tel_id_np[keep_mask],
+                        "n_pe":      n_pe_np[keep_mask],
+                        "p_trig":    p_np[keep_mask],
+                    }
+                    cols.update({k: v[keep_mask] for k, v in extra_np.items()})
+                    if pre_threshold_score_np is not None:
+                        cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np[keep_mask]
+                    writer.append(cols, fold_idx=fold_idx)
+
+                print(f"[group {i_batch+1}] total events so far: {total_events} "
+                      f"(this group: {group_events})")
+                # Full per-fold detail every 20 batches (and always on the last
+                # printed one) keeps the log readable when many folds share a
+                # group, instead of N lines per batch for N folds.
+                if i_batch % 20 == 0:
+                    for fold_name, *_ in fold_setup:
+                        st = accum[fold_name]
+                        g_eff = st["gamma_trig"] / st["gamma_total"] if st["gamma_total"] > 0 else 0.0
+                        n_rate = (st["nsb_trig"] / st["nsb_total"] / self.window_size) if st["nsb_total"] > 0 else 0.0
+                        if st["gamma_score_chunks"] and st["nsb_score_chunks"]:
+                            st["roc_auc"] = roc_auc_mann_whitney(
+                                np.concatenate(st["gamma_score_chunks"]), np.concatenate(st["nsb_score_chunks"])
+                            )
+                        auc_txt = f"{st['roc_auc']*100:.2f}%" if np.isfinite(st["roc_auc"]) else "NA"
+                        print(f"  [{fold_name}] gamma {st['gamma_trig']}/{st['gamma_total']} "
+                              f"({g_eff*100:.2f}%)  nsb {st['nsb_trig']}/{st['nsb_total']} "
+                              f"({n_rate:.1f} Hz)  AUC={auc_txt}")
 
                 if stop_flags["requested"]:
                     stop_flags["interrupted"] = True
@@ -1418,24 +1497,29 @@ class TriggerChain:
             if stop_flags["interrupted"]:
                 break
 
-            # Exact ROC AUC over the full fold (matches the stats report).
-            if gamma_score_chunks and nsb_score_chunks:
-                roc_auc = roc_auc_mann_whitney(
-                    np.concatenate(gamma_score_chunks), np.concatenate(nsb_score_chunks)
-                )
-            all_stats[fold_name] = {
-                "gamma_total": int(gamma_total),
-                "gamma_trig": int(gamma_trig),
-                "gamma_efficiency": gamma_eff,
-                "roc_auc": roc_auc,
-                "nsb_total": int(nsb_total),
-                "nsb_trig": int(nsb_trig),
-                "nsb_rate_hz": nsb_rate_hz,
-            }
-            print(f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  "
-                  f"NSB rate={nsb_rate_hz:.1f} Hz  "
-                  f"AUC={roc_auc*100:.2f}% ---" if np.isfinite(roc_auc)
-                  else f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  NSB rate={nsb_rate_hz:.1f} Hz ---")
+            for fold_name, fold_idx, *_ in fold_setup:
+                st = accum[fold_name]
+                gamma_eff = st["gamma_trig"] / st["gamma_total"] if st["gamma_total"] > 0 else 0.0
+                nsb_rate_hz = (st["nsb_trig"] / st["nsb_total"] / self.window_size) if st["nsb_total"] > 0 else 0.0
+                # Exact ROC AUC over the full fold (matches the stats report).
+                if st["gamma_score_chunks"] and st["nsb_score_chunks"]:
+                    st["roc_auc"] = roc_auc_mann_whitney(
+                        np.concatenate(st["gamma_score_chunks"]), np.concatenate(st["nsb_score_chunks"])
+                    )
+                roc_auc = st["roc_auc"]
+                all_stats[fold_name] = {
+                    "gamma_total": int(st["gamma_total"]),
+                    "gamma_trig": int(st["gamma_trig"]),
+                    "gamma_efficiency": gamma_eff,
+                    "roc_auc": roc_auc,
+                    "nsb_total": int(st["nsb_total"]),
+                    "nsb_trig": int(st["nsb_trig"]),
+                    "nsb_rate_hz": nsb_rate_hz,
+                }
+                print(f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  "
+                      f"NSB rate={nsb_rate_hz:.1f} Hz  "
+                      f"AUC={roc_auc*100:.2f}% ---" if np.isfinite(roc_auc)
+                      else f"--- fold '{fold_name}': eff={gamma_eff*100:.2f}%  NSB rate={nsb_rate_hz:.1f} Hz ---")
 
         if not stop_flags["interrupted"]:
             trig_rate = writer.close(window_sec=self.window_size)
@@ -1452,8 +1536,22 @@ class TriggerChain:
                 writer.close(window_sec=self.window_size)
             except Exception:
                 pass
-        # Restore original SIGINT handler
+        # Restore original signal handlers
         signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+        # Belt-and-suspenders: terminate any AsyncFileOpenerProcess workers
+        # still alive no matter how we got here (graceful stop, exception, or
+        # normal completion). Each is a `multiprocessing.Process`, so it shows
+        # up in active_children() regardless of which fold's dataset spawned
+        # it; killing the main process (SIGTERM/SIGKILL) does NOT cascade to
+        # these on its own -- they were found orphaned, still holding their
+        # loaded data in memory, after a `kill` on a stuck run. This sweep
+        # only matters when the graceful SIGTERM path above didn't run (e.g.
+        # SIGKILL, which no code -- here or anywhere -- can react to).
+        for child in mp.active_children():
+            if child.is_alive():
+                child.terminate()
 
         # Delete partial file if run was interrupted
         if stop_flags["interrupted"] and os.path.exists(out_h5_path):

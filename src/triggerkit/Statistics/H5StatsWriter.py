@@ -104,9 +104,14 @@ class H5StatsWriter:
         self._datasets[name] = ds
         return ds
 
-    def append(self, cols: dict):
+    def append(self, cols: dict, fold_idx: int = None):
         """
         cols: dict of {name: 1D numpy array}, all same length.
+        fold_idx: target a specific fold explicitly instead of "whichever fold
+        begin_fold() was most recently called for". Needed when several folds'
+        rows are appended in an interleaved order within the same batch loop
+        (e.g. several folds sharing one read pass over the same source data,
+        each still writing its own rows) rather than one fold fully at a time.
         """
         # basic checks
         keys = list(cols.keys())
@@ -115,12 +120,14 @@ class H5StatsWriter:
             if len(cols[k]) != n:
                 raise ValueError(f"Column {k} has len {len(cols[k])} != {n}")
 
-        # Tag every row with the current fold index (auto-open a default fold so a
-        # caller that never calls begin_fold still gets a valid single-fold file).
-        if self._fold_idx < 0:
-            self.begin_fold("all")
+        # Tag every row with the target fold index (auto-open a default fold so
+        # a caller that never calls begin_fold still gets a valid single-fold
+        # file).
+        idx = self._fold_idx if fold_idx is None else fold_idx
+        if idx < 0:
+            idx = self.begin_fold("all")
         cols = dict(cols)
-        cols["fold"] = np.full(n, self._fold_idx, dtype=np.uint8)
+        cols["fold"] = np.full(n, idx, dtype=np.uint8)
 
         old = self.n_rows
         new = old + n
@@ -141,7 +148,7 @@ class H5StatsWriter:
         n_pe = cols.get("n_pe", None)
 
         if label is not None:
-            cur = self.folds[self._fold_idx]
+            cur = self.folds[idx]
             label = np.asarray(label)
             if n_clusters is not None:
                 n_clusters = np.asarray(n_clusters)
