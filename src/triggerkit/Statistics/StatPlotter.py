@@ -59,6 +59,11 @@ except Exception:  # pragma: no cover
 
 ConfigType = List[Tuple[str, Dict[str, Any]]]
 
+#: Sentinel for "no fold override given" (as opposed to an explicit fold=None,
+#: which means "aggregate every fold"). Distinguishes an unset per-plot/per-config
+#: override from a deliberate request to read the unfiltered file.
+_FOLD_UNSET = object()
+
 
 # Default effective-area generation setup for the current SST-1M production:
 #   NSHOW = 3000
@@ -247,6 +252,10 @@ class StatPlotter:
         # fold="rot120_rolled" restricts every event read to that single fold, so
         # the same plots can be drawn per fold to inspect leakage in detail.
         self._fold_filter = fold
+        # The constructor's fold is the RESET point for any per-plot/per-config
+        # override made below (see _apply_fold_override): an entry that doesn't
+        # ask for a specific fold falls back to this, not to "aggregate everything".
+        self._default_fold = fold
 
         self.float_atol = float_atol
         self.float_rtol = float_rtol
@@ -770,6 +779,26 @@ class StatPlotter:
                 f"(available: {names})")
         idx = names.index(self._fold_filter)
         return np.asarray(grp["fold"][sl]).reshape(-1) == idx
+
+    def _apply_fold_override(self, fold: Any = _FOLD_UNSET) -> None:
+        """Switch the active fold for the NEXT data read.
+
+        ``fold=_FOLD_UNSET`` (default) resets to the constructor's fold. An
+        explicit value (including ``None`` = aggregate every fold) overrides it.
+        Every cache keyed only by file path (``_score_rate_cache``,
+        ``_score_threshold_cache``, ``_roc_auc_cache``) is invalidated when the
+        fold actually changes, since those caches were built assuming one fold
+        per file for the plotter's lifetime -- comparing several conditions
+        (e.g. low/medium/high NSB) stored as folds of the SAME file breaks that
+        assumption, so a fold switch must not reuse a stale cached value.
+        """
+        resolved = self._default_fold if fold is _FOLD_UNSET else fold
+        if resolved == self._fold_filter:
+            return
+        self._fold_filter = resolved
+        self._score_rate_cache.clear()
+        self._score_threshold_cache.clear()
+        self._roc_auc_cache.clear()
 
     def _label_mask(self, label_chunk: np.ndarray, kind: str) -> np.ndarray:
         # label is typically 0/1 integers, but we handle strings too
@@ -1418,9 +1447,16 @@ class StatPlotter:
         self._queued_plot_colors = {}
         return self
 
-    def add_plot(self, to_compare_config: ConfigType, label: Optional[str] = None, **kwargs) -> "StatPlotter":
+    def add_plot(self, to_compare_config: ConfigType, label: Optional[str] = None,
+                 fold: Any = _FOLD_UNSET, **kwargs) -> "StatPlotter":
         """
         Queue a configuration to be plotted.
+
+        ``fold`` optionally overrides the plotter's default fold (set in the
+        constructor) for THIS one queued entry -- e.g. to plot the same chain
+        config under several NSB conditions (each stored as a fold of the same
+        file) as separate series in the same figure: ``add_plot(cfg,
+        label="TDSCAN (low)", fold="low")``.
 
         Any extra kwargs are stored and passed to the underlying addPlotXXX method
         when you call showPlot(plot_type=...).
@@ -1433,7 +1469,8 @@ class StatPlotter:
         config_key = self._config_color_key(to_compare_config)
         if config_key not in self._queued_plot_colors:
             self._queued_plot_colors[config_key] = self._color_for_palette_index(len(self._queued_plot_colors))
-        self._queued_plots.append({"config": to_compare_config, "label": label, "kwargs": dict(kwargs)})
+        self._queued_plots.append(
+            {"config": to_compare_config, "label": label, "fold": fold, "kwargs": dict(kwargs)})
         return self
 
     def _normalize_plot_type(self, plot_type: str) -> str:
@@ -1494,6 +1531,7 @@ class StatPlotter:
             self.initPlotAbsolute(**abs_kwargs)
             for item in getattr(self, "_queued_plots", []):
                 kw = dict(item.get("kwargs") or {})
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotAbsolute(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1512,6 +1550,7 @@ class StatPlotter:
             self.initPlotRatio(**ratio_kwargs)
             for item in getattr(self, "_queued_plots", []):
                 kw = dict(item.get("kwargs") or {})
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotRatio(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1533,6 +1572,7 @@ class StatPlotter:
             self.initPlotEffectiveAreaCounts(**ea_counts_kwargs)
             for item in getattr(self, "_queued_plots", []):
                 kw = dict(item.get("kwargs") or {})
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotEffectiveAreaCounts(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1552,6 +1592,7 @@ class StatPlotter:
             self.initPlotEffectiveArea(**ea_kwargs)
             for item in getattr(self, "_queued_plots", []):
                 kw = dict(item.get("kwargs") or {})
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotEffectiveArea(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1573,6 +1614,7 @@ class StatPlotter:
                 item_max_points = kw.pop("max_points", init_kwargs.get("max_points", 20_000))
                 target_key = None if item_target_rate_hz is None else float(item_target_rate_hz)
                 draw_target_rate_line = target_key is not None and target_key not in drawn_target_rates
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotTriggerRateVsThreshold(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1598,6 +1640,7 @@ class StatPlotter:
                 item_metric_bins = kw.pop("metric_bins", init_kwargs.get("metric_bins"))
                 target_key = None if item_target_rate_hz is None else float(item_target_rate_hz)
                 draw_target_rate_line = target_key is not None and target_key not in drawn_target_rates
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
                 self.addPlotEfficiencyVsTriggerRate(
                     to_compare_config=item["config"],
                     label=item.get("label"),
@@ -1768,6 +1811,7 @@ class StatPlotter:
         Uses the base config's stored events (the gamma sample is shared across
         configs), so this is the distribution of the whole dataset.
         """
+        self._apply_fold_override()  # whole-dataset plot: reset to the default fold
         metric = self._normalize_metric_name(metric)
         try:
             values = self._collect_metric_values(self.base_config_result, metric, kind=kind)
@@ -1909,7 +1953,8 @@ class StatPlotter:
         with self._report_style_context():
             plt.close("all")
             plt.figure()
-            for cfg, label in plot_items:
+            for cfg, label, fold in plot_items:
+                self._apply_fold_override(fold)
                 result = self.get_results(cfg)
                 if result is None or not result.get("has_pre_threshold_score", False):
                     continue
@@ -1948,7 +1993,8 @@ class StatPlotter:
         with self._report_style_context():
             plt.close("all")
             plt.figure()
-            for cfg, label in plot_items:
+            for cfg, label, fold in plot_items:
+                self._apply_fold_override(fold)
                 result = self.get_results(cfg)
                 if result is None or not result.get("has_pre_threshold_score", False):
                     continue
@@ -2031,6 +2077,7 @@ class StatPlotter:
         return os.path.exists(full_path)
 
     def _render_npe_vs_energy(self, energy_range, n_pe_range, full_path, show, e_bins=60, npe_bins=60):
+        self._apply_fold_override()  # whole-dataset plot: reset to the default fold
         result = self.base_config_result
         e_edges = np.logspace(np.log10(max(energy_range[0], 1e-4)), np.log10(energy_range[1]), e_bins)
         npe_edges = np.logspace(np.log10(max(n_pe_range[0], 1e-3)), np.log10(n_pe_range[1]), npe_bins)
@@ -2306,7 +2353,7 @@ class StatPlotter:
 
     def _report_render_queued_plot(
         self,
-        plot_items: List[Tuple[ConfigType, str]],
+        plot_items: List[Tuple[ConfigType, str, Any]],
         *,
         plot_type: str,
         filename: str,
@@ -2320,8 +2367,8 @@ class StatPlotter:
         with self._report_style_context():
             plt.close("all")
             self.init_plot()
-            for cfg, label in plot_items:
-                self.add_plot(cfg, label=label)
+            for cfg, label, fold in plot_items:
+                self.add_plot(cfg, label=label, fold=fold)
             self.showPlot(
                 filename=filename,
                 show=show,
@@ -2656,11 +2703,18 @@ class StatPlotter:
             else:
                 configs = list(configs)
 
+            # An entry may be a bare config (a LIST of (stage, params) tuples) or
+            # ``(config, fold)`` sugar -- a plain tuple whose second element is a
+            # fold name -- to plot the SAME chain under a different fold of the
+            # same file (e.g. an NSB condition stored via augment.make_condition_folds).
+            # A real config is always a list, so the tuple form is unambiguous.
+            configs = [(c, _FOLD_UNSET) if isinstance(c, list) else tuple(c) for c in configs]
+
             legend_overrides = list(legend_overrides) if legend_overrides is not None else None
 
             if include_base_config:
-                if self.base_reference_config not in configs:
-                    configs = [self.base_reference_config] + configs
+                if not any(cfg == self.base_reference_config for cfg, _fold in configs):
+                    configs = [(self.base_reference_config, _FOLD_UNSET)] + configs
                     if legend_overrides is not None:
                         legend_overrides = [None] + legend_overrides
 
@@ -2676,9 +2730,9 @@ class StatPlotter:
 
             resolved_configs: List[ConfigType] = []
             skipped_configs: List[str] = []
-            config_descriptions: List[Tuple[ConfigType, str, str, str]] = []
+            config_descriptions: List[Tuple[ConfigType, str, str, str, Any]] = []
 
-            for idx, cfg in enumerate(configs):
+            for idx, (cfg, fold_override) in enumerate(configs):
                 label = self._report_config_label(cfg, index=idx)
                 short_name = self._report_config_short_name(cfg, index=idx)
                 if legend_overrides is not None and idx < len(legend_overrides):
@@ -2691,13 +2745,16 @@ class StatPlotter:
                     continue
                 slug = self._report_config_slug(cfg, idx)
                 resolved_configs.append(cfg)
-                config_descriptions.append((cfg, label, slug, short_name))
+                config_descriptions.append((cfg, label, slug, short_name, fold_override))
 
             if not resolved_configs:
                 raise ValueError("None of the requested configurations were found in the stat folder.")
 
             combined_sections: List[Tuple[str, str]] = []
-            report_plot_items = [(cfg, short_name) for cfg, _label, _slug, short_name in config_descriptions]
+            report_plot_items = [
+                (cfg, short_name, fold_override)
+                for cfg, _label, _slug, short_name, fold_override in config_descriptions
+            ]
 
             def add_combined_plot(section_title: str, filename: str, plot_type: str, location: str = "best", **kwargs) -> None:
                 full_path = os.path.join(output_dir, filename)
@@ -2818,8 +2875,8 @@ class StatPlotter:
             # fold with Wilson bars; flat = no leak. Embedded as a report section
             # (no standalone file).
             if cross_validation:
-                cv_configs = [cfg for cfg, _l, _s, _n in config_descriptions]
-                cv_labels = [short_name for _c, _l, _s, short_name in config_descriptions]
+                cv_configs = [cfg for cfg, _l, _s, _n, _f in config_descriptions]
+                cv_labels = [short_name for _c, _l, _s, short_name, _f in config_descriptions]
                 cv_path = os.path.join(output_dir, "cross_validation.png")
                 if self._render_cross_validation(
                     cv_configs, cv_labels, cv_path, show, n_sigma=cross_validation_n_sigma,
@@ -2843,7 +2900,8 @@ class StatPlotter:
                 combined_sections.append(("Gamma Efficiency vs Impact Distance", "efficiency_vs_impact_distance.png"))
 
             # Per-config: pre-threshold score distribution (gamma vs NSB) + 2D efficiency map.
-            for _idx, (cfg, _label, slug, short_name) in enumerate(config_descriptions):
+            for _idx, (cfg, _label, slug, short_name, fold_override) in enumerate(config_descriptions):
+                self._apply_fold_override(fold_override)
                 quantizer_fn = f"score_quantizer_{slug}.png"
                 if self._render_score_quantizer(
                     cfg, short_name, os.path.join(output_dir, quantizer_fn), show,
@@ -2865,7 +2923,8 @@ class StatPlotter:
                     combined_sections.append((f"Efficiency Map (E × impact distance) — {short_name}", map_fn))
 
             individual_sections: List[Tuple[str, str]] = []
-            for idx, (cfg, label, slug, short_name) in enumerate(config_descriptions):
+            for idx, (cfg, label, slug, short_name, fold_override) in enumerate(config_descriptions):
+                self._apply_fold_override(fold_override)
                 result = self.get_results(cfg)
                 if result is None:
                     continue
@@ -2909,9 +2968,10 @@ class StatPlotter:
                 fh.write("\n")
 
                 fh.write("## Configurations\n\n")
-                for idx, (_cfg, label, slug, short_name) in enumerate(config_descriptions, start=1):
+                for idx, (_cfg, label, slug, short_name, fold_override) in enumerate(config_descriptions, start=1):
                     fname = os.path.basename(str((self.get_results(_cfg) or {}).get("_filename") or slug))
-                    fh.write(f"{idx}. `{short_name}` — file: `{fname}`\n")
+                    fold_txt = f", fold: `{fold_override}`" if fold_override not in (_FOLD_UNSET, None) else ""
+                    fh.write(f"{idx}. `{short_name}` — file: `{fname}`{fold_txt}\n")
                     for si, (stage, detail) in enumerate(self._report_chain_lines(_cfg), start=1):
                         fh.write(f"   - Stage {si} — `{stage}`: {detail}\n")
                 fh.write("\n")
@@ -3001,7 +3061,7 @@ class StatPlotter:
         output_dir: str,
         title: str,
         target_rate_hz: Optional[float],
-        config_descriptions: List[Tuple[ConfigType, str, str, str]],
+        config_descriptions: List[Tuple[ConfigType, str, str, str, Any]],
         combined_sections: List[Tuple[str, str]],
         individual_sections: List[Tuple[str, str]],
         skipped_configs: List[str],
@@ -3079,7 +3139,7 @@ class StatPlotter:
 
             row_y = header_y - 0.028
             row_step = 0.030
-            for idx, (_cfg, label, slug, short_name) in enumerate(config_descriptions, start=1):
+            for idx, (_cfg, label, slug, short_name, _fold) in enumerate(config_descriptions, start=1):
                 if row_y < 0.06:
                     pdf.savefig(fig, facecolor=paper)
                     plt.close(fig)
@@ -3115,7 +3175,7 @@ class StatPlotter:
                          fontweight="bold", color=ink, va="top")
                 dy = 0.86
 
-            for idx, (_cfg, _label, _slug, short_name) in enumerate(config_descriptions, start=1):
+            for idx, (_cfg, _label, _slug, short_name, _fold) in enumerate(config_descriptions, start=1):
                 # Resolve the stored chain to find a score_quantizer (for the inset).
                 stored_chain = (self.get_results(_cfg) or {}).get("trigger_chain") or _cfg
                 sq_edges = None
@@ -3297,7 +3357,7 @@ class StatPlotter:
         output_dir: str,
         title: str,
         target_rate_hz: Optional[float],
-        config_descriptions: List[Tuple[ConfigType, str, str, str]],
+        config_descriptions: List[Tuple[ConfigType, str, str, str, Any]],
         combined_sections: List[Tuple[str, str]],
         individual_sections: List[Tuple[str, str]],
         skipped_configs: List[str],
@@ -3357,7 +3417,7 @@ class StatPlotter:
 
         # ---- Trigger-chain details (text + score-quantizer note). ----
         detail_rows: List[str] = []
-        for cfg_i, (_cfg, _label, _slug, short_name) in enumerate(config_descriptions, start=1):
+        for cfg_i, (_cfg, _label, _slug, short_name, _fold) in enumerate(config_descriptions, start=1):
             color = self._get_config_plot_color(_cfg)
             lines_html = "".join(
                 f'<div class="chain-line">Stage {si}: <b>{esc(stage)}</b>: {esc(detail)}</div>'

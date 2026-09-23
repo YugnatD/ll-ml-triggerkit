@@ -134,10 +134,18 @@ class Fold:
     is a small human-readable dict describing how the fold was built (gamma
     degrees, NSB kind + param, seed); it is stored per fold in the statistics
     HDF5 so the file is self-describing and reproducible.
+
+    ``gamma_files`` / ``nsb_files`` optionally override the SOURCE files this
+    fold reads from (default ``None`` = the chain's own files). This is what
+    makes a fold able to express a real dataset swap -- e.g. a different NSB
+    condition (low/medium/... simulated separately, not a permutation of the
+    same data) -- rather than only a pixel reindex of one fixed dataset. See
+    :func:`make_condition_folds`.
     """
 
     def __init__(self, name, gamma_index, nsb_index, config=None,
-                 gamma_time_shift=0, nsb_time_shift=0):
+                 gamma_time_shift=0, nsb_time_shift=0,
+                 gamma_files=None, nsb_files=None):
         self.name = str(name)
         self.gamma_index = np.asarray(gamma_index, dtype=np.int64)
         self.nsb_index = np.asarray(nsb_index, dtype=np.int64)
@@ -146,6 +154,9 @@ class Fold:
         # Applied waveform-only, per class; 0 = no temporal shift.
         self.gamma_time_shift = int(gamma_time_shift)
         self.nsb_time_shift = int(nsb_time_shift)
+        # Per-fold data-source override (None = use the chain's own files).
+        self.gamma_files = gamma_files
+        self.nsb_files = nsb_files
         if self.gamma_index.shape != self.nsb_index.shape:
             raise ValueError(
                 f"fold {name!r}: gamma_index {self.gamma_index.shape} and "
@@ -154,7 +165,43 @@ class Fold:
     def __repr__(self):
         return (f"Fold(name={self.name!r}, P={self.gamma_index.size}, "
                 f"gamma_time_shift={self.gamma_time_shift}, "
-                f"nsb_time_shift={self.nsb_time_shift})")
+                f"nsb_time_shift={self.nsb_time_shift}, "
+                f"gamma_files={'override' if self.gamma_files else 'chain'}, "
+                f"nsb_files={'override' if self.nsb_files else 'chain'})")
+
+
+def make_condition_folds(geometry, conditions):
+    """Build one no-reindex :class:`Fold` per named data-source condition.
+
+    Unlike :func:`make_rotation_folds` (a synthetic pixel permutation of ONE
+    fixed dataset, used to detect leakage), each fold here swaps in a REAL,
+    independently-simulated dataset -- e.g. a different NSB brightness level
+    (low/medium/high) that was simulated separately, with its OWN gamma files
+    too (a lower/higher NSB regime is re-simulated for gammas as well, not just
+    for the bias-curve file). ``gamma_index``/``nsb_index`` stay identity (no
+    pixel reindex); only the source files change.
+
+    ``conditions`` is a ``{name: (gamma_files, nsb_files)}`` mapping, e.g. built
+    from ``dataset_config.CONDITIONS`` via ``{n: dataset_config.get_condition(n)
+    for n in dataset_config.CONDITIONS}``. Add a condition there (e.g. "high",
+    "real_data") and it flows through here unchanged.
+
+    Every resulting fold lands in the SAME statistics HDF5 as any other fold
+    (rotation or condition) passed to ``compute_statistics(folds=...)`` -- one
+    file, one ``fold`` column, one ``/folds`` summary group -- so
+    ``StatPlotter(fold=<condition name>)`` (or a per-plot ``fold=`` override)
+    selects a condition exactly like it selects a rotation fold.
+    """
+    P = int(geometry.n_pixels)
+    identity = identity_index(P)
+    folds = []
+    for name, (gamma_files, nsb_files) in conditions.items():
+        folds.append(Fold(
+            name, gamma_index=identity, nsb_index=identity,
+            config={"condition": name},
+            gamma_files=list(gamma_files), nsb_files=list(nsb_files),
+        ))
+    return folds
 
 
 #: Keys accepted by a dict-form fold spec, with their defaults.

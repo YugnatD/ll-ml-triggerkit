@@ -42,7 +42,9 @@ OUTPUT_DIR = "trigger_report"
 # The real patch7 telescope trigger (digital_sum patch7 + threshold, no TDSCAN).
 CONFIG_PATCH7 = [
     ("digital_sum", {"mode": "patch7"}),
-    ("threshold", {"threshold": 241.99998474121094, "binary": True, "comparison": "gt"}),
+    # ("threshold", {"threshold": 241.99998474121094, "binary": True, "comparison": "gt"}),
+    ("threshold", {"threshold": 241.999985, "binary": True, "comparison": "gt"}),
+
 ]
 
 # The deployed TDSCAN chain: eps_xy=1, eps_t=2 (10 shared ring weights), float
@@ -54,19 +56,35 @@ CONFIG_TDSCAN = [
         "eps_xy": 1, "eps_t": 2, "filters": 1, "share_neighbors": True,
         "ring_weights": [0.5, 0.0625, -0.5, -0.0039, -1.0, -0.25, 1.0, 0.125, 0.5, 0.25],
     }),
-    ("threshold", {"threshold": 97.9535903930664, "binary": True, "comparison": "gt"}),
+    ("threshold", {"threshold": 97.95359, "binary": True, "comparison": "gt"}),
+]
+
+# Trigger chain info: [('score_quantizer', {'edges': [16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0, 88.0, 96.0, 104.0, 112.0, 120.0, 128.0]}), ('tdscan', {'eps_xy': 1, 'eps_t': 2, 'filters': 1, 'share_neighbors': True, 'id': '5f1a764aaa557569ce7023f5b2488415', 'ring_weights': [[0.5, -0.0078], [-0.5, -0.0312], [-0.5, -0.125], [0.5, 0.0625], [0.5, 0.25]]}), ('threshold', {'threshold': 8.249999, 'binary': True, 'comparison': 'gt'})]
+CONFIG_TDSCAN_INQ4_P2 = [
+    ("score_quantizer", {'edges': [16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0, 72.0, 80.0, 88.0, 96.0, 104.0, 112.0, 120.0, 128.0]}),
+    ("tdscan", {
+        "eps_xy": 1, "eps_t": 2, "filters": 1, "share_neighbors": True,
+        "ring_weights": [[0.5, -0.0078], [-0.5, -0.0312], [-0.5, -0.125], [0.5, 0.0625], [0.5, 0.25]],
+    }),
+    ("threshold", {'threshold': 8.249999, 'binary': True, 'comparison': 'gt'}),
 ]
 
 # Base reference for ratio plots (must match one of the .h5 files).
 BASE_CONFIG = CONFIG_PATCH7
 
 # The configs to plot, and 1:1 legend labels.
-PLOT_CONFIGS = [CONFIG_PATCH7, CONFIG_TDSCAN]
-LEGENDS = ["PATCH7", "TDSCAN ml xy1,t2"]
+PLOT_CONFIGS = [CONFIG_PATCH7, CONFIG_TDSCAN, CONFIG_TDSCAN_INQ4_P2]
+# PLOT_CONFIGS = [CONFIG_PATCH7, CONFIG_TDSCAN_INQ4_P2]
+
+LEGENDS = ["PATCH7", "TDSCAN Pow2 xy1,t2", "TDSCAN INQ4 wPow2"]
+# LEGENDS = ["PATCH7", "TDSCAN INQ4 wPow2"]
+
 
 
 def main():
-    plotter = StatPlotter(base_reference_config=BASE_CONFIG, stat_folder=STAT_FOLDERS)
+    plotter = StatPlotter(base_reference_config=BASE_CONFIG,
+                          stat_folder=STAT_FOLDERS,
+                          fold="rot0_original")
 
     score_threshold, predicted_rate_hz = plotter.find_score_threshold_for_target_rate(
         TARGET_RATE_HZ)

@@ -1074,12 +1074,17 @@ class TriggerChain:
     # summaries live in the /folds group. StatPlotter can then aggregate all folds
     # or slice a single one. `folds=None` is the plain single-pass run (one fold
     # named "all"), byte-for-byte compatible with the old fold-free output.
+    # A fold may ALSO override the source files entirely (e.g. a different NSB
+    # condition -- low/medium/... -- simulated independently, not a permutation
+    # of one fixed dataset; see augment.make_condition_folds). None = use this
+    # chain's own self.simtel_path / self.simtel_nsb_path, as before.
     if folds is None:
-        fold_plan = [("all", None, None, {}, 0, 0)]
+        fold_plan = [("all", None, None, {}, 0, 0, None, None)]
     else:
         fold_plan = [(f.name, f.gamma_index, f.nsb_index, getattr(f, "config", {}),
                       int(getattr(f, "gamma_time_shift", 0)),
-                      int(getattr(f, "nsb_time_shift", 0)))
+                      int(getattr(f, "nsb_time_shift", 0)),
+                      getattr(f, "gamma_files", None), getattr(f, "nsb_files", None))
                      for f in folds]
         print(f"Cross-validation: {len(fold_plan)} folds -> "
               f"{[name for name, *_ in fold_plan]}")
@@ -1251,7 +1256,7 @@ class TriggerChain:
     try:
         # Each fold is a full independent pass over the data, streamed into the
         # same writer under its own fold index (all folds share one HDF5 file).
-        for fold_name, gamma_idx, nsb_idx, fold_cfg, gts, nts in fold_plan:
+        for fold_name, gamma_idx, nsb_idx, fold_cfg, gts, nts, fold_gamma_files, fold_nsb_files in fold_plan:
             reindex = gamma_idx is not None or nsb_idx is not None
             if reindex:
                 gi = tf.constant(
@@ -1272,9 +1277,13 @@ class TriggerChain:
             writer.begin_fold(fold_name, fold_cfg)
 
             print("Computing statistics with current model...")
+            if fold_gamma_files is not None or fold_nsb_files is not None:
+                print(f"    fold '{fold_name}' overrides source files: "
+                      f"gamma={'custom' if fold_gamma_files is not None else 'chain default'}, "
+                      f"nsb={'custom' if fold_nsb_files is not None else 'chain default'}")
             stats_dataset = SimTelTFDataset(
-                gamma_files=self.simtel_path,
-                nsb_files=self.simtel_nsb_path,
+                gamma_files=fold_gamma_files if fold_gamma_files is not None else self.simtel_path,
+                nsb_files=fold_nsb_files if fold_nsb_files is not None else self.simtel_nsb_path,
                 opener_cls=AsyncFileOpenerProcess,
                 config=cfg
             )

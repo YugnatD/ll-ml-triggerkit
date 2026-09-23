@@ -1,15 +1,13 @@
 """Compute SST-1M trigger statistics for a TDSCAN chain -- on triggerkit.
 
-Port of the sandbox's ``evaluate_perf_tdscan.py`` onto the packaged API. It
-builds the deployed (filters=1) TDSCAN chain, optionally pins a set of ring
-weights, tunes the threshold ``tau`` to a target NSB rate, then writes the
+Port of the sandbox's ``evaluate_perf_tdscan.py`` onto the packaged API. The
+chain itself -- eps_xy/eps_t, pinned ring weights, frozen tau -- is defined
+ONCE in ``tdscan_chain.py`` (next to this file) and imported here, exactly
+like the sandbox's own ``tdscan_chain.build_chain``: ``show_tdscan_chain.py``,
+``train_tdscan.py`` and this script all call the SAME function instead of each
+keeping its own copy of the same constants. This script only adds its own
+concerns on top: the fold specs, the target-rate tau tuning, and writing the
 per-event statistics HDF5 that the report generator (``stats_report.py``) reads.
-
-    sandbox                            triggerkit
-    ----------------------------------------------------------------
-    tdscan_chain.build_chain(...)   -> TDSCANBody(...).build(chain)
-    (the rest -- find_threshold_for_target_rate, compute_statistics -- are
-     TriggerChain methods and are unchanged)
 
 Run it:
 
@@ -22,11 +20,8 @@ import glob
 import os
 import sys
 
-import numpy as np
-
-from triggerkit.TriggerChain import TriggerChain
+import tdscan_chain
 from triggerkit.augment import make_rotation_folds
-from triggerkit.models import TDSCANBody, generate_lin_space_edges
 
 # --- Config (mirrors evaluate_perf_tdscan.py) --------------------------------
 BASE_NAME = "simu_cross"
@@ -118,105 +113,23 @@ n_folds = len(FOLD_SPECS)
 MAX_GAMMA_EVENTS = TOTAL_GAMMAS_EVENTS // n_folds
 MAX_NSB_EVENTS = TOTAL_NSB_EVENTS // n_folds
 
-# Score-quantizer front-end: bucket each pixel's input into 2**EDGES_NUM_BIT - 1
-# integer levels spaced over EDGES_RANGE=(lo, hi) before TDSCAN (mimics the FPGA
-# ADC quantization of the waveform). To DISABLE it, set EDGES_FUNC = None (like
-# every other None-able knob); it's also skipped when EDGES_NUM_BIT == 0 or
-# hi <= lo. Don't set EDGES_RANGE = None -- that would crash on edges_range[1].
-EDGES_RANGE = (16, 128)   # (lo, hi) span the quantizer edges cover
-EDGES_NUM_BIT = 4         # bit depth -> 2**4 - 1 = 15 levels
-# EDGES_FUNC = generate_lin_space_edges   # edge-placement fn (from triggerkit.models); None disables the quantizer
-EDGES_FUNC = None   # edge-placement fn (from triggerkit.models); None disables the quantizer
-
-
-# Inner accumulator quantization (the FPGA fixed-point path inside the TDSCAN
-# filter). Each qspec is "<U|S>Q<int_bits>.<frac_bits>": UQ4.0 = unsigned 4-bit
-# integer (0..15), SQ9.0 = signed 9-bit integer, UQ3.1 = unsigned 3.1 fixed point.
-#   input                 -> waveform fed into the filter
-#   ring_weights          -> the learned weights
-#   convolution_accumulator / convolution_rescale_shift -> the spatial (per-ring)
-#       accumulator qspec and its post-accumulation right-shift
-#   temporal_accumulator  / temporal_rescale_shift       -> same for the time sum
-# Set to None to run in full float (no inner quantization).
-# QUANTIZE_STEP = {
-#     "input": "UQ4.0",
-#     "ring_weights": "UQ3.1",
-#     "convolution_accumulator": "SQ9.0",
-#     "convolution_rescale_shift": 0,
-#     "temporal_accumulator": "SQ9.0",
-#     "temporal_rescale_shift": 0,
-# }
-
-QUANTIZE_STEP = None
-
-# TDSCAN accumulator overflow / rounding + post-accumulation right-shift.
-OVERFLOW_MODE = "AP_SAT"        # saturate on overflow
-QUANTIZATION_MODE = "AP_TRN"    # truncate on rounding
-RESCALE_SHIFT = 0               # right-shift (÷2**n) the accumulator after summation to rescale back into range; 0 = no rescale
-
-# Optional front-/back-end stages (all off by default -> the deployed chain).
-SUBTRACT_VALUE = None           # scalar subtracted before TDSCAN (FPGA pedestal/"shift" subtraction); None = no subtract stage
-SUBTRACT_QUANTIZE_STEP = None   # fixed-point for the subtract stage, keys input/shift_value/output, e.g. {"input": "UQ8.0", "shift_value": "UQ8.0", "output": "SQ9.0"}
-SUBTRACT_OVERFLOW_MODE = "AP_WRAP"      # subtract-stage overflow behaviour
-SUBTRACT_QUANTIZATION_MODE = "AP_TRN"   # subtract-stage rounding behaviour
-DIGITAL_SUM_MODE = None         # digital-sum stage after TDSCAN summing pixel scores over a patch, e.g. "patch7" (7-pixel patch trigger); None = off
-FADC = False                    # shared FADC baseline-subtraction front-end before TDSCAN; False = off
-
-# TDSCAN kernel geometry -- MUST match the deployed filter (tdscan_chain.py:
-# EPS_XY=1, EPS_T=2) and the RING_WEIGHTS length below.
-EPS_XY = 1
-EPS_T = 2
-
-# Flat ring weights to pin (share_neighbors=True). Length must match the kernel:
-# eps_t=1 -> 6, eps_t=2 -> 10, ... (so with EPS_T=2 this is a 10-value vector).
-# Set to None to keep the build-time init.
-RING_WEIGHTS = np.array(
-    [0.5000, 0.0625, -0.5000, -0.0039, -1.0000, -0.2500, 1.0000, 0.1250, 0.5000, 0.2500])
-
-
 def main():
     if len(sys.argv) < 3:
         sys.exit(f"usage: {sys.argv[0]} GAMMA_GLOB NSB_GLOB [OUTPUT_FOLDER]")
     gamma_files = sorted(glob.glob(sys.argv[1]))
     nsb_files = sorted(glob.glob(sys.argv[2]))
     output_folder = sys.argv[3] if len(sys.argv) > 3 else "simu_sst1m_tel2_tdscan"
+
     if not gamma_files or not nsb_files:
         sys.exit("no gamma or NSB files matched the given globs.")
     print(f"Found {len(gamma_files)} gamma files, {len(nsb_files)} NSB files.")
 
-    # --- The deployed filters=1 TDSCAN chain, via the packaged body ----------
-    chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    handles = TDSCANBody(
-        filters=1,
-        eps_xy=EPS_XY,
-        eps_t=EPS_T,
-        edges_range=EDGES_RANGE,
-        edges_num_bit=EDGES_NUM_BIT,
-        edges_func=EDGES_FUNC,
-        quantize_step=QUANTIZE_STEP,
-        overflow_mode=OVERFLOW_MODE,
-        quantization_mode=QUANTIZATION_MODE,
-        rescale_shift=RESCALE_SHIFT,
-        subtract_value=SUBTRACT_VALUE,
-        subtract_quantize_step=SUBTRACT_QUANTIZE_STEP,
-        subtract_overflow_mode=SUBTRACT_OVERFLOW_MODE,
-        subtract_quantization_mode=SUBTRACT_QUANTIZATION_MODE,
-        digital_sum_mode=DIGITAL_SUM_MODE,
-        fadc=FADC,
-    ).build(chain)
-    tdscan_layer, threshold_layer = handles["tdscan"], handles["threshold"]
-
-    # Pin (and freeze) the TDSCAN weights: shared -> ring_weights.
-    if RING_WEIGHTS is not None:
-        if tdscan_layer.share_neighbors:
-            print(f"Setting TDSCAN ring weights to {RING_WEIGHTS}")
-            tdscan_layer.set_weights_from_params(share_weights=True, ring_weights=RING_WEIGHTS)
-        else:
-            print(f"Setting TDSCAN kernel weights to {RING_WEIGHTS}")
-            tdscan_layer.set_weights_from_params(share_weights=False, kernel_weights=RING_WEIGHTS)
-
-    # find_threshold_for_target_rate needs chain.model to locate the threshold.
-    chain.compile_chain()
+    # --- The deployed filters=1 TDSCAN chain, shared with show_tdscan_chain.py
+    # and train_tdscan.py via tdscan_chain.build_chain (see that module for the
+    # actual eps_xy/eps_t/ring_weights/tau knobs). tau=None here: this script
+    # re-tunes it below to the target NSB rate rather than keeping the pinned one.
+    chain, tdscan_layer, threshold_layer = tdscan_chain.build_chain(
+        gamma_files, nsb_files, tau=None)
 
     # Tune tau ONCE on the nominal NSB and freeze it for every fold, so a rate
     # drift across folds is a real signal rather than a re-tuning artefact.
