@@ -1306,13 +1306,24 @@ class TriggerChain:
             writer.begin_fold(fold_name, fold_cfg)
 
             print("Computing statistics with current model...")
-            if fold_gamma_files is not None or fold_nsb_files is not None:
-                print(f"    fold '{fold_name}' overrides source files: "
-                      f"gamma={'custom' if fold_gamma_files is not None else 'chain default'}, "
-                      f"nsb={'custom' if fold_nsb_files is not None else 'chain default'}")
+            resolved_gamma_files = fold_gamma_files if fold_gamma_files is not None else self.simtel_path
+            resolved_nsb_files = fold_nsb_files if fold_nsb_files is not None else self.simtel_nsb_path
+            # Always print WHICH files this fold actually reads -- a rotation
+            # fold (gamma_idx/nsb_idx set, gamma_files/nsb_files None) silently
+            # falls back to the chain's own (reference-condition) files, while a
+            # condition fold (see augment.make_condition_folds) overrides them
+            # with a different, independently-simulated dataset. Without this,
+            # e.g. "low" vs "medium" NSB is indistinguishable from the fold name
+            # alone in the progress log.
+            _n_gamma = len(resolved_gamma_files) if resolved_gamma_files else 0
+            print(f"    fold '{fold_name}' source: gamma={_n_gamma} file(s)"
+                  + (f" [{resolved_gamma_files[0]}, ...]" if _n_gamma else "")
+                  + f", nsb={resolved_nsb_files}"
+                  + ("" if fold_gamma_files is not None or fold_nsb_files is not None
+                     else " (chain default)"))
             stats_dataset = SimTelTFDataset(
-                gamma_files=fold_gamma_files if fold_gamma_files is not None else self.simtel_path,
-                nsb_files=fold_nsb_files if fold_nsb_files is not None else self.simtel_nsb_path,
+                gamma_files=resolved_gamma_files,
+                nsb_files=resolved_nsb_files,
                 opener_cls=AsyncFileOpenerProcess,
                 config=cfg
             )
