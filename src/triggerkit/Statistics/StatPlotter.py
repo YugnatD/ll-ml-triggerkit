@@ -310,6 +310,14 @@ class StatPlotter:
         self._warned_messages: set[str] = set()
         self._queued_plot_colors: Dict[str, str] = {}
         self._active_plot_colors: Dict[str, str] = {}
+        self._active_plot_linestyles: Dict[str, str] = {}
+        # Shade-by-fold overlay mode (see _get_config_plot_color /
+        # _get_fold_plot_linestyle): off by default so every existing
+        # single-condition report keeps its plain config colors unchanged.
+        # generateReport turns this on only while rendering the dedicated
+        # "all conditions overlaid" plot alongside the per-condition pages.
+        self._shade_by_fold_active: bool = False
+        self._active_plot_shade_idx: Dict[str, int] = {}
 
         # base trigger-rate cache
         if isinstance(self.base_config_result.get("trigger_rate"), tuple):
@@ -363,10 +371,64 @@ class StatPlotter:
         queued_color = self._queued_plot_colors.get(config_key)
         if queued_color is not None:
             self._active_plot_colors.setdefault(config_key, queued_color)
-            return queued_color
-        if config_key not in self._active_plot_colors:
-            self._active_plot_colors[config_key] = self._color_for_palette_index(len(self._active_plot_colors))
-        return self._active_plot_colors[config_key]
+            base = queued_color
+        elif config_key in self._active_plot_colors:
+            base = self._active_plot_colors[config_key]
+        else:
+            base = self._active_plot_colors[config_key] = self._color_for_palette_index(len(self._active_plot_colors))
+        if self._shade_by_fold_active:
+            return self._apply_fold_shade(base)
+        return base
+
+    # Tint/shade cycle for the "all conditions overlaid" plot: first
+    # condition seen is blended toward white (lighter), second toward black
+    # (darker), extending outward for a 3rd/4th condition. Positive = blend
+    # fraction toward white, negative = blend fraction (as abs value) toward
+    # black.
+    _distinct_plot_shade_deltas = [0.35, -0.22, 0.6, -0.42, 0.15, -0.6]
+
+    def _apply_fold_shade(self, base_hex: str) -> str:
+        fold_key = "__all__" if self._fold_filter is None else str(self._fold_filter)
+        if fold_key not in self._active_plot_shade_idx:
+            self._active_plot_shade_idx[fold_key] = len(self._active_plot_shade_idx)
+        idx = self._active_plot_shade_idx[fold_key]
+        delta = self._distinct_plot_shade_deltas[idx % len(self._distinct_plot_shade_deltas)]
+        r, g, b = colors.to_rgb(base_hex)
+        if delta >= 0:
+            r, g, b = (r + (1.0 - r) * delta, g + (1.0 - g) * delta, b + (1.0 - b) * delta)
+        else:
+            f = -delta
+            r, g, b = (r * (1.0 - f), g * (1.0 - f), b * (1.0 - f))
+        return colors.to_hex((r, g, b))
+
+    # Color already separates curves by trigger CONFIG (same chain -> same
+    # color across every fold/condition it's plotted under, see
+    # _get_config_plot_color above). That leaves same-chain, different-fold
+    # curves (e.g. PATCH7 under "low" vs "medium") drawn in an identical
+    # color -- indistinguishable except by reading the legend text. Linestyle
+    # fills that second axis: keyed on the currently active fold
+    # (self._fold_filter, set by _apply_fold_override right before each
+    # curve is drawn), auto-assigned in order of first appearance and reset
+    # per combined plot alongside the color state (_reset_custom_legend_state)
+    # -- so it stays automatic as more conditions or configs are added later,
+    # with no per-plot hardcoding needed.
+    _distinct_plot_linestyle_cycle = ["-", "--", ":", "-.",
+                                       (0, (3, 1, 1, 1)), (0, (1, 1))]
+
+    def _linestyle_for_palette_index(self, index: int) -> Any:
+        return self._distinct_plot_linestyle_cycle[index % len(self._distinct_plot_linestyle_cycle)]
+
+    def _get_fold_plot_linestyle(self) -> Any:
+        if self._shade_by_fold_active:
+            # Shade already encodes the condition axis in this mode (see
+            # _apply_fold_shade) -- stacking dashes on top would double-encode
+            # the same distinction and add visual noise for no extra clarity.
+            return "-"
+        fold_key = "__all__" if self._fold_filter is None else str(self._fold_filter)
+        if fold_key not in self._active_plot_linestyles:
+            self._active_plot_linestyles[fold_key] = self._linestyle_for_palette_index(
+                len(self._active_plot_linestyles))
+        return self._active_plot_linestyles[fold_key]
 
     def _metric_xlabel(self, metric: str) -> str:
         metric_name = self._normalize_metric_name(metric)
@@ -1501,6 +1563,12 @@ class StatPlotter:
             "trigger_rate_scan": "trigger_rate_vs_threshold",
             "rate_vs_threshold": "trigger_rate_vs_threshold",
             "threshold_scan": "trigger_rate_vs_threshold",
+            # trigger rate scan, per-curve normalized threshold axis
+            "trigger_rate_vs_threshold_normalized": "trigger_rate_vs_threshold_normalized",
+            "trigger-rate-vs-threshold-normalized": "trigger_rate_vs_threshold_normalized",
+            "rate_vs_threshold_normalized": "trigger_rate_vs_threshold_normalized",
+            "threshold_scan_normalized": "trigger_rate_vs_threshold_normalized",
+            "normalized_threshold_scan": "trigger_rate_vs_threshold_normalized",
             # gamma-efficiency vs rate tradeoff
             "efficiency_vs_trigger_rate": "efficiency_vs_trigger_rate",
             "efficiency-vs-trigger-rate": "efficiency_vs_trigger_rate",
@@ -1624,6 +1692,20 @@ class StatPlotter:
                 )
                 if target_key is not None:
                     drawn_target_rates.add(target_key)
+
+        elif pt == "trigger_rate_vs_threshold_normalized":
+            rate_norm_kwargs = pick(["title", "x_range", "y_range"])
+            self.initPlotTriggerRateVsThresholdNormalized(**rate_norm_kwargs)
+            for item in getattr(self, "_queued_plots", []):
+                kw = dict(item.get("kwargs") or {})
+                item_max_points = kw.pop("max_points", init_kwargs.get("max_points", 20_000))
+                self._apply_fold_override(item.get("fold", _FOLD_UNSET))
+                self.addPlotTriggerRateVsThresholdNormalized(
+                    to_compare_config=item["config"],
+                    label=item.get("label"),
+                    target_rate_hz=kw.pop("target_rate_hz", init_kwargs.get("target_rate_hz")),
+                    max_points=item_max_points,
+                )
 
         elif pt == "efficiency_vs_trigger_rate":
             eff_rate_kwargs = pick(["title", "x_range", "y_range", "target_rate_hz", "max_points"])
@@ -1965,7 +2047,8 @@ class StatPlotter:
                 fpr, tpr = roc_curve(gamma, nsb)
                 auc = self._config_roc_auc(result)
                 auc_txt = f"; AUC={auc * 100.0:.1f}%" if np.isfinite(auc) else ""
-                plt.plot(fpr, tpr, color=self._get_config_plot_color(cfg), label=f"{label}{auc_txt}")
+                plt.plot(fpr, tpr, color=self._get_config_plot_color(cfg),
+                         linestyle=self._get_fold_plot_linestyle(), label=f"{label}{auc_txt}")
                 drew = True
             if not drew:
                 plt.close("all")
@@ -2014,7 +2097,8 @@ class StatPlotter:
                 trig_h = np.histogram(r[inr & trig], bins=edges)[0]
                 eff, eff_err = self._efficiency_from_counts(all_h, trig_h)
                 curve_label = f"{label}; {self._rate_suffix(strategy.get('trigger_rate_hz', 0.0))}"
-                plt.errorbar(centers, eff, yerr=eff_err, fmt="o-", markersize=3, capsize=2,
+                plt.errorbar(centers, eff, yerr=eff_err, fmt="o", markersize=3, capsize=2,
+                             linestyle=self._get_fold_plot_linestyle(),
                              color=self._get_config_plot_color(cfg), label=curve_label)
                 drew = True
             if not drew:
@@ -2364,6 +2448,15 @@ class StatPlotter:
     ) -> bool:
         if not plot_items:
             return False
+        # A caller-supplied `title` must reach the actual initPlotXXX call
+        # (via plot_kwargs -> showPlot -> _render_queued_plot's "title" pick)
+        # to show up as the real plot title -- _report_style_current_figure
+        # below only back-fills a title when the axes ends up with NONE at
+        # all, and every initPlotXXX here sets its own default title first,
+        # so a title passed only to _report_style_current_figure is silently
+        # dropped whenever it differs from that default.
+        if title is not None:
+            plot_kwargs.setdefault("title", title)
         with self._report_style_context():
             plt.close("all")
             self.init_plot()
@@ -2474,16 +2567,45 @@ class StatPlotter:
             out[i] = (auc, self._auc_standard_error(auc, pos.size, neg.size))
         return out
 
+    def _filter_cv_folds(
+        self,
+        folds: List[Dict[str, Any]],
+        condition: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Restrict a file's folds to one condition's rotation/shuffle family.
+
+        The leakage check's reference point is ``folds[0]`` -- a physically
+        honest trigger stays FLAT (within n_sigma) across every OTHER fold in
+        the list. That assumption breaks the moment a fold from a genuinely
+        different NSB condition (e.g. "rot0_original_low" sitting next to
+        fifteen "..._medium" rotation/shuffle/roll variants) is mixed in: it
+        differs by design, not by leakage, but a blind ``folds[0]`` would use
+        it as the reference band every _medium fold gets compared against
+        (or, worse, get compared itself and look like a huge, fake leak).
+        ``condition=None`` keeps every fold (single-condition reports,
+        unaffected). ``condition="medium"`` keeps only folds whose name ends
+        with "_medium", matching how make_rotation_folds names each
+        condition's instance ("<base>_<condition>").
+        """
+        if condition is None:
+            return folds
+        suffix = f"_{condition}"
+        return [d for d in folds if str(d.get("fold", "")).endswith(suffix)]
+
     def _resolve_cv_rows(
         self,
         configs: Optional[List[ConfigType]],
         legend_overrides: Optional[List[Optional[str]]],
+        condition: Optional[str] = None,
     ) -> List[Tuple[str, List[Dict[str, Any]]]]:
         """Resolve the ``(label, folds)`` rows to draw for the CV plot.
 
         ``configs=None`` picks every loaded stats file carrying a ``/folds``
         group; otherwise each config is matched to its file. Files without a
         ``/folds`` group are silently skipped (they are plain single-pass runs).
+        ``condition`` restricts each file's folds to one condition's family
+        (see ``_filter_cv_folds``); a file left with fewer than 2 folds after
+        filtering is skipped (nothing to compare).
         """
         rows: List[Tuple[str, List[Dict[str, Any]]]] = []
         if configs is None:
@@ -2493,8 +2615,8 @@ class StatPlotter:
                 if not path or path in seen:
                     continue
                 seen.add(path)
-                folds = self._read_folds_group(path)
-                if folds:
+                folds = self._filter_cv_folds(self._read_folds_group(path) or [], condition)
+                if len(folds) >= 2:
                     rows.append((self._cv_label_for_chain(res.get("trigger_chain", [])), folds))
         else:
             for i, config in enumerate(configs):
@@ -2502,9 +2624,9 @@ class StatPlotter:
                 if res is None or not self._is_h5(res):
                     self._warn_once(f"cv-miss-{i}", f"cross-validation: no stats file matched config #{i}; skipping.")
                     continue
-                folds = self._read_folds_group(res["_path"])
-                if not folds:
-                    continue  # plain single-pass file -- nothing to draw
+                folds = self._filter_cv_folds(self._read_folds_group(res["_path"]) or [], condition)
+                if len(folds) < 2:
+                    continue  # plain single-pass file, or nothing left after the condition filter
                 label = None
                 if legend_overrides and i < len(legend_overrides):
                     label = legend_overrides[i]
@@ -2526,7 +2648,12 @@ class StatPlotter:
         efficiency for files stored without per-event scores.
         """
         n = len(rows)
-        fig, axes = plt.subplots(n, 2, figsize=(11.5, 3.3 * n), squeeze=False)
+        # Width scales with the longest fold list actually drawn -- a fixed
+        # 11.5in crams every fold's rotated x-tick label together once there
+        # are more than a handful (17 folds on one row was unreadable).
+        max_folds = max((len(folds) for _, folds in rows), default=1)
+        fig_width = max(11.5, 0.62 * max_folds)
+        fig, axes = plt.subplots(n, 2, figsize=(fig_width, 3.3 * n), squeeze=False)
         for r, (label, folds) in enumerate(rows):
             names = [d["fold"] for d in folds]
             xs = np.arange(len(folds))
@@ -2545,16 +2672,40 @@ class StatPlotter:
                             fmt="o-", capsize=4)
                 ref = folds[0]
                 ax.axhline(ref[key], ls="--", c="gray", alpha=0.6, label="fold-0")
-                band = n_sigma * ref[err]
-                ax.axhspan(ref[key] - band, ref[key] + band, color="gray", alpha=0.10,
-                           label=f"±{n_sigma:g}σ")
+                # Band width per fold, not a single ref-only width: a fixed
+                # n_sigma * ref[err] band uses only the REFERENCE fold's own
+                # (tiny, since it's usually run at a much bigger budget --
+                # e.g. 200k/100k vs 10k/10k) sampling error, so a smaller
+                # comparison fold's genuinely larger sampling noise routinely
+                # pokes outside it and looks like a leak even under an exact
+                # symmetry (confirmed empirically: rot120 -- a plain camera
+                # rotation with nothing to leak -- drifted outside the old
+                # ref-only band purely from its own 20x-smaller sample).
+                # Combining both folds' errors in quadrature gives each
+                # fold the band width its OWN comparison actually supports.
+                combined_err = [float(np.hypot(ref[err], d[err])) for d in folds]
+                lower = [ref[key] - n_sigma * ce for ce in combined_err]
+                upper = [ref[key] + n_sigma * ce for ce in combined_err]
+                ax.fill_between(xs, lower, upper, color="gray", alpha=0.10,
+                                 label=f"±{n_sigma:g}σ (ref ⊕ fold)")
                 ax.set_xticks(xs)
                 ax.set_xticklabels(names, rotation=35, ha="right", fontsize=8)
                 ax.set_ylabel(ylab)
-                ax.set_title(f"{label}: {sub}", fontsize=10)
+                # The column-level description ("sub") is identical on every
+                # row and, appended inline to a long config label, routinely
+                # made the title wider than the subplot -- overflowing left,
+                # into the rotated y-axis label. Show it once (row 0, as a
+                # column header, on its OWN line so it doesn't widen the
+                # title further) and keep every other row's title to just
+                # its own short config label.
+                ax.set_title(f"{sub}\n{label}" if r == 0 else label, fontsize=10)
                 ax.grid(alpha=0.3)
                 ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
+        # Extra vertical padding: each row's own title sits close enough to
+        # the row above's rotated x-tick labels / this row's y-axis label to
+        # visually collide at the default spacing once there's more than one
+        # row (default tight_layout() padding assumes single-row figures).
+        fig.tight_layout(h_pad=4.0)
         return fig
 
     def _render_cross_validation(
@@ -2564,6 +2715,7 @@ class StatPlotter:
         full_path: str,
         show: bool,
         n_sigma: float = 3.0,
+        condition: Optional[str] = None,
     ) -> bool:
         """Report-integrated CV render: PNG into ``full_path`` + stash for the PDF.
 
@@ -2572,7 +2724,7 @@ class StatPlotter:
         page), rather than a standalone file. Returns False (drawing nothing)
         when no config has a ``/folds`` group.
         """
-        rows = self._resolve_cv_rows(configs, legend_overrides)
+        rows = self._resolve_cv_rows(configs, legend_overrides, condition=condition)
         if not rows:
             return False
         with self._report_style_context():
@@ -2595,6 +2747,7 @@ class StatPlotter:
         legend_overrides: Optional[List[Optional[str]]] = None,
         formats: Tuple[str, ...] = ("png",),
         show: bool = False,
+        condition: Optional[str] = None,
     ) -> Optional[str]:
         """Standalone per-fold AUC + NSB rate cross-validation plot.
 
@@ -2605,13 +2758,23 @@ class StatPlotter:
         (efficiency invariant under camera rotation, rate invariant under an NSB
         reshuffle); a drift beyond ``n_sigma`` of fold-0's band is a leak.
 
+        ``condition``: when the file's folds mix several NSB conditions (each
+        named "<base>_<condition>" by make_rotation_folds), restrict the
+        comparison to one condition's family, e.g. ``condition="medium"``.
+        Needed whenever a condition with only a lone reference fold (no
+        rotation/shuffle siblings, e.g. "low") is stored alongside one that
+        has the full family: leaving them mixed makes fold[0] (the
+        reference/band for every other fold) an arbitrary pick between two
+        conditions that differ by design, not by leakage. ``None`` keeps
+        every fold (default, matches prior behavior for single-condition runs).
+
         This writes a STANDALONE file (one per entry in ``formats``). The same
         graph is embedded automatically as a section of ``generateReport`` when
         any plotted config carries folds, so you rarely need to call this
         directly. ``configs=None`` picks every loaded file that has folds.
         Returns the first written path, or None if no config had folds.
         """
-        rows = self._resolve_cv_rows(configs, legend_overrides)
+        rows = self._resolve_cv_rows(configs, legend_overrides, condition=condition)
         if not rows:
             print("plot_cross_validation: no config with a /folds group; nothing to plot.")
             return None
@@ -2665,6 +2828,7 @@ class StatPlotter:
         impact_distance_bins: int = 40,
         cross_validation: bool = True,
         cross_validation_n_sigma: float = 3.0,
+        cross_validation_condition: Optional[str] = None,
     ) -> str:
         """
         Generate a markdown report plus the main plots commonly used in the
@@ -2756,18 +2920,96 @@ class StatPlotter:
                 for cfg, _label, _slug, short_name, fold_override in config_descriptions
             ]
 
+            # Distinct fold/condition values actually present across every
+            # combined plot's items -- e.g. ["rot0_original_low",
+            # "rot0_original_medium"] under a COMPARE_CONDITIONS-style report.
+            # More than one means every combined plot below gets faceted:
+            # one panel per condition, side by side, instead of overlaying
+            # every (config, condition) curve on one axes. Overlaying relied
+            # on linestyle to tell conditions apart (solid vs dashed) on top
+            # of color telling configs apart -- confirmed still hard to read
+            # once curves sit close together. One condition per panel needs
+            # only color (config), which is what every other, single-
+            # condition report already uses.
+            _facet_fold_order: List[Any] = []
+            for _cfg, _label, _fold in report_plot_items:
+                fold_key = _FOLD_UNSET if _fold is _FOLD_UNSET else _fold
+                if fold_key not in _facet_fold_order:
+                    _facet_fold_order.append(fold_key)
+            _facet_by_condition = len(_facet_fold_order) > 1
+
             def add_combined_plot(section_title: str, filename: str, plot_type: str, location: str = "best", **kwargs) -> None:
                 full_path = os.path.join(output_dir, filename)
-                if self._report_render_queued_plot(
-                    report_plot_items,
-                    plot_type=plot_type,
-                    filename=full_path,
-                    show=show,
-                    location=location,
-                    title=section_title,
-                    **kwargs,
-                ):
-                    combined_sections.append((section_title, filename))
+                if not _facet_by_condition:
+                    if self._report_render_queued_plot(
+                        report_plot_items,
+                        plot_type=plot_type,
+                        filename=full_path,
+                        show=show,
+                        location=location,
+                        title=section_title,
+                        **kwargs,
+                    ):
+                        combined_sections.append((section_title, filename))
+                    return
+
+                # One full page per condition -- each keeps its own vector
+                # figure (unlike a stitched raster), and each config keeps
+                # the SAME color across every condition's page since
+                # _active_plot_colors persists for the whole report.
+                stem = os.path.splitext(filename)[0]
+                ext = os.path.splitext(filename)[1] or ".png"
+                for i, fold_key in enumerate(_facet_fold_order):
+                    panel_items = [item for item in report_plot_items if
+                                   (_FOLD_UNSET if item[2] is _FOLD_UNSET else item[2]) == fold_key]
+                    condition_label = "default" if fold_key is _FOLD_UNSET else str(fold_key)
+                    panel_filename = f"{stem}__{condition_label}{ext}"
+                    panel_title = f"{section_title} — {condition_label}"
+                    # The title must go through **kwargs (the "title" plot-init
+                    # kwarg every initPlotXXX accepts), not
+                    # _report_render_queued_plot's OWN separate `title=`
+                    # argument: that one only back-fills via
+                    # _report_style_current_figure when the axes ends up with
+                    # NO title at all, and every initPlotXXX here always sets
+                    # its own default title first -- so a title passed that
+                    # way was silently dropped (confirmed: every panel
+                    # rendered with an identical title, condition suffix
+                    # never showing, before this was routed through kwargs).
+                    panel_kwargs = dict(kwargs)
+                    panel_kwargs["title"] = panel_title
+                    if self._report_render_queued_plot(
+                        panel_items,
+                        plot_type=plot_type,
+                        filename=os.path.join(output_dir, panel_filename),
+                        show=show,
+                        location=location,
+                        **panel_kwargs,
+                    ):
+                        combined_sections.append((panel_title, panel_filename))
+
+                # PLUS one additional page with every condition overlaid on
+                # the same axes -- color-shaded per condition (same hue per
+                # config, lighter for the first condition seen, darker for
+                # the next) instead of the split pages' plain per-config
+                # color, since with everything on one axes color alone can
+                # no longer tell two curves of the same config apart.
+                overlay_filename = f"{stem}__overlay{ext}"
+                overlay_title = f"{section_title} — all conditions overlaid"
+                overlay_kwargs = dict(kwargs)
+                overlay_kwargs["title"] = overlay_title
+                self._shade_by_fold_active = True
+                try:
+                    if self._report_render_queued_plot(
+                        report_plot_items,
+                        plot_type=plot_type,
+                        filename=os.path.join(output_dir, overlay_filename),
+                        show=show,
+                        location=location,
+                        **overlay_kwargs,
+                    ):
+                        combined_sections.append((overlay_title, overlay_filename))
+                finally:
+                    self._shade_by_fold_active = False
 
             add_combined_plot(
                 "NSB Trigger Rate vs Threshold",
@@ -2775,6 +3017,12 @@ class StatPlotter:
                 "trigger_rate_vs_threshold",
                 location="best",
                 target_rate_hz=target_rate_hz,
+            )
+            add_combined_plot(
+                "NSB Trigger Rate vs Threshold (Normalized)",
+                "nsb_trigger_rate_vs_threshold_normalized.png",
+                "trigger_rate_vs_threshold_normalized",
+                location="best",
             )
             add_combined_plot(
                 "Gamma Efficiency vs NSB Trigger Rate",
@@ -2871,15 +3119,33 @@ class StatPlotter:
                 combined_sections.append(("ROC Curve (gamma vs NSB)", "roc_curves.png"))
 
             # Cross-validation (per-fold leakage) -- only when a config carries a
-            # /folds group. One row per config: gamma efficiency + NSB rate vs
-            # fold with Wilson bars; flat = no leak. Embedded as a report section
-            # (no standalone file).
+            # /folds group. One row per UNIQUE underlying trigger config:
+            # gamma efficiency + NSB rate vs fold with Wilson bars; flat = no
+            # leak. Embedded as a report section (no standalone file).
+            #
+            # config_descriptions has one entry per (config, fold) pair --
+            # under COMPARE_CONDITIONS-style reports the SAME config appears
+            # once per condition (e.g. PATCH7 under "low" and again under
+            # "medium"). get_results() matches on the config alone (folds
+            # live inside one file, not one file per fold), so passing every
+            # entry through unchanged would read and draw the identical
+            # /folds group twice under two different labels. Dedup to one
+            # row per unique config here.
             if cross_validation:
-                cv_configs = [cfg for cfg, _l, _s, _n, _f in config_descriptions]
-                cv_labels = [short_name for _c, _l, _s, short_name, _f in config_descriptions]
+                seen_cv_keys: set = set()
+                cv_configs: List[ConfigType] = []
+                cv_labels: List[Optional[str]] = []
+                for cfg, label, _slug, _short_name, _fold in config_descriptions:
+                    key = self._config_color_key(cfg)
+                    if key in seen_cv_keys:
+                        continue
+                    seen_cv_keys.add(key)
+                    cv_configs.append(cfg)
+                    cv_labels.append(label)
                 cv_path = os.path.join(output_dir, "cross_validation.png")
                 if self._render_cross_validation(
                     cv_configs, cv_labels, cv_path, show, n_sigma=cross_validation_n_sigma,
+                    condition=cross_validation_condition,
                 ):
                     combined_sections.append(
                         ("Cross-Validation (per-fold AUC & NSB rate)", "cross_validation.png"))
@@ -3773,6 +4039,7 @@ class StatPlotter:
             xerr=[bin_centers - binning[:-1], binning[1:] - bin_centers],
             yerr=eff_err,
             fmt="o",
+            linestyle=self._get_fold_plot_linestyle(),
             capsize=3,
             label=label,
             color=curve_color,
@@ -3834,6 +4101,7 @@ class StatPlotter:
             xerr=xerr,
             yerr=ratio_err,
             fmt="o",
+            linestyle=self._get_fold_plot_linestyle(),
             capsize=3,
             label=label,
             color=curve_color,
@@ -4438,6 +4706,7 @@ class StatPlotter:
         self._eff_rate_bin_handles = []
         self._eff_rate_target_handle = None
         self._active_plot_colors = {}
+        self._active_plot_linestyles = {}
 
     def _apply_efficiency_vs_rate_legends(self, ax=None):
         if not getattr(self, "_use_custom_eff_rate_legend", False):
@@ -4578,6 +4847,7 @@ class StatPlotter:
             rates_hz[mask][::-1],
             efficiency[mask][::-1],
             linewidth=2.0,
+            linestyle=self._get_fold_plot_linestyle(),
             label=curve_label,
             color=curve_color,
         )
@@ -4617,7 +4887,7 @@ class StatPlotter:
         self._reset_custom_legend_state()
         plt.figure(figsize=(10, 6))
         plt.title(title or "NSB Trigger Rate vs Threshold")
-        plt.xlabel("Threshold on pre-threshold score")
+        plt.xlabel("Threshold")
         plt.ylabel("NSB Trigger Rate (Hz)")
         plt.grid(True, which="both", alpha=0.3)
         plt.yscale("log")
@@ -4666,7 +4936,8 @@ class StatPlotter:
             label = f"{label}; {self._rate_suffix(rate)}"
 
         curve_color = self._get_config_plot_color(to_compare_config)
-        line = plt.step(thresholds, rates_hz, where="post", label=label, color=curve_color)
+        line = plt.step(thresholds, rates_hz, where="post", label=label, color=curve_color,
+                         linestyle=self._get_fold_plot_linestyle())
         curve_color = line[0].get_color() if line else None
 
         if target_rate_hz is not None:
@@ -4686,6 +4957,113 @@ class StatPlotter:
                     linestyle=":",
                     alpha=0.8,
                 )
+
+    def initPlotTriggerRateVsThresholdNormalized(
+        self,
+        title: str = "",
+        x_range: Optional[Tuple[float, float]] = None,
+        y_range: Optional[Tuple[float, float]] = None,
+    ):
+        self._reset_custom_legend_state()
+        plt.figure(figsize=(10, 6))
+        plt.title(title or "NSB Trigger Rate vs Threshold (per-curve normalized)")
+        plt.xlabel("Threshold / max threshold (per curve)")
+        plt.ylabel("NSB Trigger Rate (Hz)")
+        plt.grid(True, which="both", alpha=0.3)
+        plt.yscale("log")
+        # No hardcoded (0, 1): every curve's rate only starts dropping well
+        # above 0 (the scan's low end sits at max NSB rate, flat, for a
+        # while), so a fixed 0..1 xlim leaves a large dead zone with nothing
+        # in it. Let it autoscale to where the data actually is; x_range
+        # still overrides when a fixed window across reports is wanted.
+        if x_range is not None:
+            plt.xlim(x_range)
+        if y_range is not None:
+            plt.ylim(y_range)
+
+    def addPlotTriggerRateVsThresholdNormalized(
+        self,
+        to_compare_config: ConfigType,
+        label: Optional[str] = None,
+        target_rate_hz: Optional[float] = None,
+        max_points: Optional[int] = 20_000,
+        draw_target_threshold_line: bool = True,
+    ):
+        """Same curve as addPlotTriggerRateVsThreshold, but with each curve's
+        OWN threshold axis rescaled to [0, 1] (divided by its own max
+        threshold) before plotting -- so chains/conditions with very
+        different absolute threshold scales (e.g. patch7 low sweeping
+        0..~250 vs patch7 medium sweeping 0..~300) overlay on a shared
+        [0, 1] x-axis for shape comparison, instead of the absolute-scale
+        comparison addPlotTriggerRateVsThreshold gives. No target-rate
+        horizontal line here: a single Hz value would be shared across
+        curves but each curve's OWN target threshold still lands at a
+        different normalized x position, so only the per-curve vertical
+        marker is drawn.
+        """
+        result = self.get_results(to_compare_config)
+        if result is None:
+            print("Config not found")
+            return
+        if not result.get("has_pre_threshold_score", False):
+            print(f"Config {to_compare_config} has no '{PRE_THRESHOLD_SCORE_DATASET}' dataset.")
+            return
+
+        thresholds, rates_hz = self.get_trigger_rate_curve(to_compare_config=to_compare_config)
+        if thresholds.size == 0:
+            print("No NSB pre-threshold scores found.")
+            return
+
+        if max_points is not None and thresholds.size > max_points:
+            idx = np.linspace(0, thresholds.size - 1, int(max_points), dtype=int)
+            idx = np.unique(idx)
+            thresholds = thresholds[idx]
+            rates_hz = rates_hz[idx]
+
+        max_threshold = float(np.max(thresholds)) if thresholds.size else 0.0
+        if not np.isfinite(max_threshold) or max_threshold <= 0.0:
+            print(f"Config {to_compare_config}: max threshold is {max_threshold}, cannot normalize.")
+            return
+        thresholds_norm = thresholds / max_threshold
+
+        ref_threshold = result.get("reference_threshold")
+        if target_rate_hz is None and ref_threshold is not None:
+            # _resolve_trigger_strategy(target_rate_hz=None, score_threshold=None)
+            # falls back to a STATIC per-file "trigger_rate" attribute --
+            # recorded once at generation time, identical no matter which
+            # fold is currently active (confirmed: patch7 showed the exact
+            # same "rate=300.0Hz" for BOTH its low and medium curves here).
+            # Passing the file's own stored threshold explicitly instead
+            # recomputes the rate from THIS fold's own NSB score distribution
+            # (_collect_metric_values respects the active fold filter), which
+            # is what actually varies fold to fold and is the whole point of
+            # a per-condition label.
+            strategy = self._resolve_trigger_strategy(result, score_threshold=float(ref_threshold))
+        else:
+            strategy = self._resolve_trigger_strategy(result, target_rate_hz=target_rate_hz)
+        rate = float(strategy.get("trigger_rate_hz", 0.0))
+        if label is None:
+            label = self.generate_label_text(
+                to_compare_config,
+                rate,
+                threshold_override=strategy.get("reference_threshold"),
+            )
+        else:
+            label = f"{label}; {self._rate_suffix(rate)}"
+
+        curve_color = self._get_config_plot_color(to_compare_config)
+        line = plt.step(thresholds_norm, rates_hz, where="post", label=label, color=curve_color,
+                         linestyle=self._get_fold_plot_linestyle())
+        curve_color = line[0].get_color() if line else None
+
+        target_threshold = strategy.get("score_threshold")
+        if draw_target_threshold_line and target_threshold is not None and curve_color is not None:
+            plt.axvline(
+                float(target_threshold) / max_threshold,
+                color=curve_color,
+                linestyle=":",
+                alpha=0.8,
+            )
 
     def _is_outside_right_legend_location(self, location: Optional[str]) -> bool:
         normalized = str(location or "").strip().lower().replace("-", " ").replace("_", " ")
@@ -5283,7 +5661,8 @@ class StatPlotter:
             label = f"{label}; {self._rate_suffix(rate)}"
 
         curve_color = self._get_config_plot_color(to_compare_config)
-        plt.plot(x_values, trig, linestyle="--", label=f"Triggered ({label})", color=curve_color)
+        plt.plot(x_values, trig, linestyle=self._get_fold_plot_linestyle(),
+                 label=f"Triggered ({label})", color=curve_color)
 
     def addPlotEffectiveArea(
         self,
@@ -5354,10 +5733,12 @@ class StatPlotter:
 
         aeff, sigma = self._aeff_from_hist(trig, thrown, A_gen_m2)
         curve_color = self._get_config_plot_color(to_compare_config)
+        curve_linestyle = self._get_fold_plot_linestyle()
         if plot_errors:
-            plt.errorbar(x_values, aeff, yerr=sigma, fmt="-o", capsize=3, label=label, color=curve_color)
+            plt.errorbar(x_values, aeff, yerr=sigma, fmt="o", linestyle=curve_linestyle,
+                         capsize=3, label=label, color=curve_color)
         else:
-            plt.plot(x_values, aeff, "-o", label=label, color=curve_color)
+            plt.plot(x_values, aeff, marker="o", linestyle=curve_linestyle, label=label, color=curve_color)
 
 
 

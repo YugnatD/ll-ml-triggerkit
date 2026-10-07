@@ -82,9 +82,12 @@ class FADC(tf.keras.layers.Layer):
             # (B,N) -> (B,N,1,1)
             b = b[:, :, tf.newaxis, tf.newaxis]
 
-        # Integer baseline subtract + clip to [0, 4095]
+        # Integer baseline subtract + upper clip only: the FADC gateware
+        # clipper is min(x, CLIP_LEVEL) on SIGNED values, so pixels below
+        # baseline stay negative in the triplet sum; the only clip to 0 is on
+        # the triplet sum below.
         wf_sub = wf_i - b
-        wf_sub = tf.clip_by_value(wf_sub, 0, 4095)  # (B,N,T,1)
+        wf_sub = tf.minimum(wf_sub, 4095)  # (B,N,T,1)
 
         # Gather triplet channels for each patch: (B, M, 3, T, 1)
         gathered = tf.gather(wf_sub, self.triplet_idx, axis=1)

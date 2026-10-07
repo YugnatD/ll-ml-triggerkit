@@ -240,15 +240,24 @@ FOLD_SPEC_KEYS = {
 }
 
 #: Keys every dict-form fold spec MUST set itself -- no default, deliberately.
-#: This fold's own gamma / NSB event budget: e.g. give "rot0_original" a
-#: bigger budget than its siblings for more precise stats on the fold you
-#: care about most, instead of an implicit total-events / n_folds split.
-_REQUIRED_SPEC_KEYS = ("gamma_events", "nsb_events")
+#: - gamma_events/nsb_events: this fold's own event budget, e.g. give
+#:   "rot0_original" a bigger budget than its siblings for more precise stats
+#:   on the fold you care about most, instead of an implicit total-events /
+#:   n_folds split.
+#: - conditions: a non-empty list of condition names (keys of the
+#:   condition_files mapping passed to make_rotation_folds) this fold should
+#:   be instantiated under -- ONE Fold per listed condition, each reading
+#:   that condition's own gamma/NSB files, each paying this row's
+#:   gamma_events/nsb_events budget separately (list 2 conditions for one row
+#:   and its budget is paid twice, not split). Most rows list just the
+#:   reference condition; give a specific row more conditions to test it
+#:   across NSB levels without doing that for every fold.
+_REQUIRED_SPEC_KEYS = ("gamma_events", "nsb_events", "conditions")
 
 
 def _normalize_spec(spec, i):
     """Return ``(gamma_deg, gamma_time_shift, kind, param, nsb_time_shift,
-    name, gamma_events, nsb_events)``.
+    name, gamma_events, nsb_events, conditions)``.
 
     Dict form only (self-documenting; see make_rotation_folds). The legacy
     positional ``(gamma_aug, nsb_aug)`` tuple form predates per-fold event
@@ -265,8 +274,9 @@ def _normalize_spec(spec, i):
     if missing:
         raise ValueError(
             f"fold spec #{i}: missing required key(s) {missing} -- every fold "
-            "spec must set its own gamma_events/nsb_events explicitly (no "
-            "implicit total-events / n_folds split).")
+            "spec must set its own gamma_events/nsb_events/conditions "
+            "explicitly (no implicit total-events / n_folds split, no "
+            "implicit condition).")
 
     allowed = set(FOLD_SPEC_KEYS) | set(_REQUIRED_SPEC_KEYS)
     unknown = set(spec) - allowed
@@ -280,44 +290,73 @@ def _normalize_spec(spec, i):
     # event" is a legitimate, deliberate choice, not a forgotten budget.
     gamma_events = None if g["gamma_events"] is None else int(g["gamma_events"])
     nsb_events = None if g["nsb_events"] is None else int(g["nsb_events"])
+    conditions = g["conditions"]
+    if not isinstance(conditions, (list, tuple)) or not conditions:
+        raise ValueError(
+            f"fold spec #{i}: 'conditions' must be a non-empty list of "
+            f"condition names, got {conditions!r}.")
+    conditions = list(conditions)
     return (g["gamma_deg"], int(g["gamma_time_shift"]), g["nsb_kind"],
             g["nsb_param"], int(g["nsb_time_shift"]), g["name"],
-            gamma_events, nsb_events)
+            gamma_events, nsb_events, conditions)
 
 
-def make_rotation_folds(geometry, specs, *, seed=1337, tol_frac=0.1):
+def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac=0.1):
     """Build a list of :class:`Fold` from compact fold specs.
 
-    Each spec row is a flat dict; every key is optional EXCEPT ``gamma_events``
-    /``nsb_events``, which every row must set explicitly -- this fold's own
-    event budget (no implicit total-events / n_folds split, so e.g. the one
-    fold you care most about can get a bigger budget than its siblings). The
-    other key names are exactly those stored in the per-fold ``config`` of the
-    statistics HDF5, so the spec and the output file read the same::
+    ``condition_files`` is a REQUIRED ``{condition_name: (gamma_files,
+    nsb_files)}`` mapping, e.g. built from ``dataset_config.CONDITIONS`` via
+    ``{n: dataset_config.get_condition(n) for n in dataset_config.CONDITIONS}``.
+    It resolves the names each spec's ``conditions`` list references.
+
+    Each spec row is a flat dict; every key is optional EXCEPT
+    ``gamma_events``/``nsb_events``/``conditions``, which every row must set
+    explicitly:
+
+    * ``gamma_events``/``nsb_events`` -- this fold's own event budget (no
+      implicit total-events / n_folds split, so e.g. the one fold you care
+      most about can get a bigger budget than its siblings).
+    * ``conditions`` -- a non-empty list of condition names (keys of
+      ``condition_files``) this ONE spec should be instantiated under. Most
+      rows list just the reference condition (e.g. ``["medium"]``); list more
+      than one to run that specific fold against several NSB conditions --
+      each listed condition becomes its OWN :class:`Fold` (named
+      ``"<base_name>_<condition>"``, reading that condition's own files), and
+      pays this row's gamma_events/nsb_events budget separately (2 conditions
+      on one row = that row's budget paid twice, not split).
+
+    The other key names are exactly those stored in the per-fold ``config`` of
+    the statistics HDF5, so the spec and the output file read the same::
 
         make_rotation_folds(chain.geom, [
-            {"gamma_events": 100_000, "nsb_events": 40_000},  # reference fold
-            {"gamma_events": 100_000, "nsb_events": 40_000, "gamma_deg": 120},
             {"gamma_events": 100_000, "nsb_events": 40_000,
-             "nsb_kind": "shuffle", "nsb_param": 2024},        # reshuffle NSB pixels
+             "conditions": ["low", "medium"]},                    # reference fold, both conditions
+            {"gamma_events": 100_000, "nsb_events": 40_000,
+             "conditions": ["medium"], "gamma_deg": 120},          # just the reference condition
+            {"gamma_events": 100_000, "nsb_events": 40_000,
+             "conditions": ["medium"],
+             "nsb_kind": "shuffle", "nsb_param": 2024},            # reshuffle NSB pixels
             {"gamma_events": 500_000, "nsb_events": 40_000,
-             "gamma_time_shift": 5, "nsb_time_shift": 5},      # this one gets more stats
+             "conditions": ["medium"],
+             "gamma_time_shift": 5, "nsb_time_shift": 5},          # this one gets more stats
             {"gamma_events": 100_000, "nsb_events": 40_000,
-             "nsb_time_shift": 5, "name": "nsb_only_troll5"},  # roll NSB only
-        ])
+             "conditions": ["medium"],
+             "nsb_time_shift": 5, "name": "nsb_only_troll5"},      # roll NSB only
+        ], condition_files={"low": (...), "medium": (...)})
 
     Keys and defaults: ``name`` (auto), ``gamma_deg`` (0),
     ``gamma_time_shift`` (0), ``nsb_kind`` ("original"), ``nsb_param`` (None),
-    ``nsb_time_shift`` (0); ``gamma_events``/``nsb_events`` have NO default and
-    are required. An unknown or missing key raises, so typos (and a forgotten
-    budget) surface immediately.
+    ``nsb_time_shift`` (0); ``gamma_events``/``nsb_events``/``conditions`` have
+    NO default and are required. An unknown or missing key raises, so typos
+    (and a forgotten budget or condition) surface immediately.
     """
     P = int(geometry.n_pixels)
     folds = []
     used_names = {}
     for i, spec in enumerate(specs):
         (gamma_deg, gamma_time_shift, kind, param,
-         nsb_time_shift, explicit_name, gamma_events, nsb_events) = _normalize_spec(spec, i)
+         nsb_time_shift, explicit_name, gamma_events, nsb_events,
+         conditions) = _normalize_spec(spec, i)
         gamma_idx = rotation_index(geometry, gamma_deg, tol_frac=tol_frac)
         if kind == "original":
             nsb_idx = identity_index(P)
@@ -330,7 +369,7 @@ def make_rotation_folds(geometry, specs, *, seed=1337, tol_frac=0.1):
             nsb_idx = shuffle_index(P, nsb_param)
         else:
             raise ValueError(f"unknown nsb_kind {kind!r}; use original/rolled/shuffle.")
-        config = {
+        base_config = {
             "gamma_deg": gamma_deg,
             "nsb_kind": kind,
             "nsb_param": nsb_param,
@@ -338,26 +377,43 @@ def make_rotation_folds(geometry, specs, *, seed=1337, tol_frac=0.1):
             "nsb_time_shift": nsb_time_shift,
             "seed": seed,
         }
-        # Fold name must be unique (it keys the /folds table and StatPlotter's
-        # fold lookup). Base name is rot<deg>_<kind>; append the param when set,
-        # a _troll<k> suffix for a temporal roll, and a _<n> suffix only if that
-        # still collides (e.g. two identical rows).
-        name = explicit_name or f"rot{gamma_deg}_{kind}"
+        # Base name is rot<deg>_<kind>; append the param when set, a
+        # _troll<k> suffix for a temporal roll.
+        base_name = explicit_name or f"rot{gamma_deg}_{kind}"
         if explicit_name is None:
             if nsb_param is not None:
-                name = f"{name}{nsb_param}"
+                base_name = f"{base_name}{nsb_param}"
             if gamma_time_shift:
-                name = f"{name}_troll{gamma_time_shift}"
+                base_name = f"{base_name}_troll{gamma_time_shift}"
             if nsb_time_shift:
-                name = f"{name}_ntroll{nsb_time_shift}"
-        if name in used_names:
-            used_names[name] += 1
-            name = f"{name}_{used_names[name]}"
-        else:
-            used_names[name] = 0
-        folds.append(Fold(name, gamma_idx, nsb_idx, config=config,
-                          gamma_time_shift=gamma_time_shift,
-                          nsb_time_shift=nsb_time_shift,
-                          max_gamma_events=gamma_events,
-                          max_nsb_events=nsb_events))
+                base_name = f"{base_name}_ntroll{nsb_time_shift}"
+
+        for cond in conditions:
+            if cond not in condition_files:
+                raise ValueError(
+                    f"fold spec #{i}: condition {cond!r} not found in "
+                    f"condition_files (available: {sorted(condition_files)}).")
+            gamma_files, nsb_files = condition_files[cond]
+
+            # Fold name must be unique (it keys the /folds table and
+            # StatPlotter's fold lookup); a _<n> suffix only if it still
+            # collides (e.g. two identical rows naming the same condition).
+            name = f"{base_name}_{cond}"
+            if name in used_names:
+                used_names[name] += 1
+                name = f"{name}_{used_names[name]}"
+            else:
+                used_names[name] = 0
+
+            config = dict(base_config)
+            config["condition"] = cond
+            folds.append(Fold(
+                name, gamma_idx, nsb_idx, config=config,
+                gamma_time_shift=gamma_time_shift,
+                nsb_time_shift=nsb_time_shift,
+                max_gamma_events=gamma_events,
+                max_nsb_events=nsb_events,
+                gamma_files=list(gamma_files),
+                nsb_files=list(nsb_files),
+            ))
     return folds

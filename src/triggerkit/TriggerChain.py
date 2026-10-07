@@ -157,12 +157,19 @@ class TriggerChain:
     self.input_layer = tf.keras.Input(shape=(self.num_pixels, self.num_samples), dtype=tf.uint16, name="waveform")
     self.input_baseline = tf.keras.Input(shape=(self.num_pixels,), dtype=tf.int32, name="pedestal")
     self.last_layer = self.input_layer
+    # input_baseline is only wired into the graph by the "fadc" stage; track
+    # that explicitly instead of inferring it from camera_name (see
+    # compile_chain / compile_chain_autoencoder), so any camera/chain that
+    # skips fadc gets a single-input model instead of a Keras "inputs not
+    # connected to outputs" error.
+    self._baseline_connected = False
 
   def add_stage(self, stage_name, **kwargs):
     if stage_name == "digital_sum":
         mode = kwargs.get('mode', 'patch7')
+        threshold_flower = kwargs.get('threshold_flower', None)
         neighbors = DigitalSumChannelList(self.camera_name)
-        digital_sum_layer = DigitalSum(input_geometry=self.last_geom, neighbors=neighbors, mode=mode)
+        digital_sum_layer = DigitalSum(input_geometry=self.last_geom, neighbors=neighbors, mode=mode, threshold_flower=threshold_flower)
         self.last_layer = digital_sum_layer(self.last_layer)
         self.last_geom = digital_sum_layer.output_geometry
         return digital_sum_layer
@@ -198,6 +205,7 @@ class TriggerChain:
         baseline_layer = FADC(input_geometry=self.last_geom,digi_sum_channel_list=neighbors)
         self.last_geom = baseline_layer.output_geometry
         self.last_layer = baseline_layer([self.last_layer, self.input_baseline])
+        self._baseline_connected = True
         return baseline_layer
     elif stage_name == "moving_average":
         window_size = kwargs.get('window_size', 3)
@@ -326,13 +334,15 @@ class TriggerChain:
             self.model.history.history = history
         self.model.summary()
         return
-    # if the camera name is Digicam_R0Alpha the pedestal has already been subtracted in the input, so we can set the baseline to 0
-    if self.camera_name == "DigiCam_R0Alpha":
+    # input_baseline is a real Keras input only when the "fadc" stage wired it
+    # in; otherwise Keras rejects it as disconnected ("inputs not connected
+    # to outputs").
+    if not self._baseline_connected:
         self.model = tf.keras.Model(
             inputs=self.input_layer,
             outputs=self.last_layer
         )
-    else:    
+    else:
         self.model = tf.keras.Model(
             inputs=[self.input_layer, self.input_baseline],
             outputs=self.last_layer
@@ -385,7 +395,7 @@ class TriggerChain:
   def compile_chain_autoencoder(self, optimizer=None, loss=None, metrics=None):
     # ensure model exists
     if not hasattr(self, "model") or self.model is None:
-        if self.camera_name == "DigiCam_R0Alpha":
+        if not self._baseline_connected:
             self.model = tf.keras.Model(
                 inputs=self.input_layer,
                 outputs=self.last_layer
@@ -1414,11 +1424,29 @@ class TriggerChain:
                     # stop contributing on its own, not just when BOTH are done
                     # -- otherwise it would keep overshooting every batch until
                     # the slower class finally catches up.
+                    #
+                    # Exact per-event truncation, not per-batch: a cap can be
+                    # crossed mid-batch, so keep only events up to the precise
+                    # position where the running total would reach the cap --
+                    # letting the whole batch through (the old behavior) made a
+                    # fold overshoot its cap by up to one batch's worth, and
+                    # that overshoot amount depends on batch_size. Two trigger
+                    # chains sharing the same fold config but run with
+                    # different batch_size (e.g. patch7 at 512 vs tdscan at 64)
+                    # would then land on different final event counts for
+                    # "the same" fold, which fails StatPlotter's
+                    # sanity_check_configs (exact gamma-count match) and
+                    # silently blocks cross-chain report plots. Exact
+                    # per-event slicing makes the final count equal the
+                    # configured gamma_events/nsb_events regardless of
+                    # batch_size.
                     keep_mask = np.ones(len(y_np), dtype=bool)
-                    if gamma_done:
-                        keep_mask &= ~gamma_mask
-                    if nsb_done:
-                        keep_mask &= ~nsb_mask
+                    if st["gamma_cap"] is not None:
+                        remaining_gamma = max(st["gamma_cap"] - st["gamma_total"], 0)
+                        keep_mask &= ~gamma_mask | (np.cumsum(gamma_mask) <= remaining_gamma)
+                    if st["nsb_cap"] is not None:
+                        remaining_nsb = max(st["nsb_cap"] - st["nsb_total"], 0)
+                        keep_mask &= ~nsb_mask | (np.cumsum(nsb_mask) <= remaining_nsb)
 
                     wf, ped = apply_fold_transform(wf0, ped0, y, reindex, gi, ni, gts, nts)
                     inp = (wf, ped) if expects_baseline else wf
@@ -1470,8 +1498,18 @@ class TriggerChain:
                         cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np[keep_mask]
                     writer.append(cols, fold_idx=fold_idx)
 
-                print(f"[group {i_batch+1}] total events so far: {total_events} "
-                      f"(this group: {group_events})")
+                # A plain, always-newline-terminated line -- NOT a \r-based
+                # "overwrite in place" trick: this line can be interleaved
+                # with a worker subprocess's own stdout/stderr writes (a
+                # separate OS process, not synchronized with this one's
+                # output at all), and an unterminated line left "open" with
+                # end="" lets that interleaved text glue directly onto it
+                # with no separator, producing actually-corrupted-looking
+                # output. A normal print() (one call, trailing newline) is a
+                # single write, so at worst lines interleave in an odd order,
+                # never mid-line garbling.
+                print(f"[group {i_batch + 1}] events so far: {total_events:,} "
+                      f"(this group: {group_events:,})")
                 # Full per-fold detail every 20 batches (and always on the last
                 # printed one) keeps the log readable when many folds share a
                 # group, instead of N lines per batch for N folds.
@@ -1549,9 +1587,20 @@ class TriggerChain:
         # loaded data in memory, after a `kill` on a stuck run. This sweep
         # only matters when the graceful SIGTERM path above didn't run (e.g.
         # SIGKILL, which no code -- here or anywhere -- can react to).
+        #
+        # terminate() alone leaves a permanent Z+ zombie: nothing else calls
+        # is_alive()/join()/poll() on these Process objects again once this
+        # sweep drops them, so the exit status is signaled but never reaped
+        # (confirmed in production -- defunct [CTAO Async File] processes
+        # piling up under a long grouped-fold run). join() after terminate()
+        # is what actually reaps; escalate to kill() if SIGTERM doesn't land.
         for child in mp.active_children():
             if child.is_alive():
                 child.terminate()
+                child.join(timeout=10)
+                if child.is_alive():
+                    child.kill()
+                    child.join(timeout=10)
 
         # Delete partial file if run was interrupted
         if stop_flags["interrupted"] and os.path.exists(out_h5_path):

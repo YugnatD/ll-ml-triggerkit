@@ -8,11 +8,15 @@ from keras.saving import register_keras_serializable
 
 @tf.keras.utils.register_keras_serializable(package="Trigger")
 class DigitalSum(tf.keras.layers.Layer):
-    def __init__(self, input_geometry: CameraGeometry, neighbors, mode="flower", **kwargs):
+    def __init__(self, input_geometry: CameraGeometry, neighbors, mode="flower", threshold_flower=None, **kwargs):
         super().__init__(**kwargs)
         self.mode = mode
         self.input_geometry = input_geometry
-        self.output_geometry = self.generate_output_geometry()
+        # Matches the legacy TriggerChainPy DigitalSum stage: for the LST
+        # flower mode, the module sum is immediately binarized in this same
+        # stage (digital_sum_result > threshold_flower), not by a separate
+        # downstream stage.
+        self.threshold_flower = threshold_flower
 
         # Keep a pure-Python structure for serialization
         if isinstance(neighbors, (list, tuple)):
@@ -25,27 +29,56 @@ class DigitalSum(tf.keras.layers.Layer):
         for n in self.neighbors:
             while len(n) < max_length:
                 n.append(-1)
-        
+
+        # generate_output_geometry (LST branch) needs self.neighbors to build
+        # each output module's centroid position, so it must run after the
+        # normalization above.
+        self.output_geometry = self.generate_output_geometry()
+
         # Works if all rows have same length (dense)
         self.neigh = tf.constant(self.neighbors, dtype=tf.int32)
-    
+
     def generate_output_geometry(self):
         if self.input_geometry.name == "DigiCam" or self.input_geometry.name == "DigiCam_R0Alpha":
             if self.mode != "patch7":
                 raise ValueError(f"DigitalSum: mode {self.mode} not recognized for camera {self.input_geometry.name}")
             return self.input_geometry
-        else: 
+        elif self.input_geometry.name == "UNKNOWN-7987PX":
+            if self.mode != "flower":
+                raise ValueError(f"DigitalSum: mode {self.mode} not recognized for camera {self.input_geometry.name}")
+            # LST flower/module grouping: each output channel is the sum of a
+            # fixed set of raw pixels (self.neighbors, no -1 padding here since
+            # every LST flower module has exactly 7 member pixels); place each
+            # module at the centroid of its member pixels for display.
+            pix_x = self.input_geometry.pix_x.to_value(u.m)
+            pix_y = self.input_geometry.pix_y.to_value(u.m)
+            pix_area = self.input_geometry.pix_area.to_value(u.m ** 2)
+            module_x = np.array([pix_x[idxs].mean() for idxs in self.neighbors])
+            module_y = np.array([pix_y[idxs].mean() for idxs in self.neighbors])
+            module_area = np.array([pix_area[idxs].sum() for idxs in self.neighbors])
+            return CameraGeometry(
+                name=self.input_geometry.name,
+                pix_id=np.arange(len(self.neighbors)),
+                pix_x=module_x * u.m,
+                pix_y=module_y * u.m,
+                pix_area=module_area * u.m**2,
+                pix_type=self.input_geometry.pix_type,
+            )
+        else:
             raise ValueError(f"DigitalSum: camera {self.input_geometry.name} not recognized")
         
-    def stage_name(self): #   
-        return f"{self.stage_type()}{self.mode}"
+    def stage_name(self): #
+        if self.threshold_flower is None:
+            return f"{self.stage_type()}{self.mode}"
+        return f"{self.stage_type()}{self.mode}{self.threshold_flower}"
     
     def stage_type(self): # *
         return "digital_sum"
     
     def get_params(self): # *
         return {
-            'mode': self.mode
+            'mode': self.mode,
+            'threshold_flower': self.threshold_flower,
         }
     
     def get_stages(self): # *
@@ -72,6 +105,8 @@ class DigitalSum(tf.keras.layers.Layer):
         gathered = tf.where(mask, gathered, tf.zeros_like(gathered))
 
         summed = tf.reduce_sum(gathered, axis=2)              # (B, M, T, C)
+        if self.threshold_flower is not None:
+            return tf.cast(summed > self.threshold_flower, summed.dtype)
         return summed
         # return tf.squeeze(summed, axis=-1)            # (B, M, T)
 
@@ -80,6 +115,7 @@ class DigitalSum(tf.keras.layers.Layer):
         config.update({
             "neighbors": self.neighbors,
             "mode": self.mode,
+            "threshold_flower": self.threshold_flower,
         })
         # config.update({"input_geometry": self.input_geometry.to_dict()})
         pix_x = self.input_geometry.pix_x.to_value(u.m).tolist()
@@ -147,5 +183,14 @@ def DigitalSumChannelList(camera_name="DigiCam"):
                 converted_digi_sum_list.append(triplet_indices)
             digi_sum_channel_list = converted_digi_sum_list
             return digi_sum_channel_list
+    elif camera_name == "UNKNOWN-7987PX":
+        # LST "flower" module grouping: each row is the 7 raw pixel indices
+        # (0..7986) physically summed into one module -- unlike the SST-1M
+        # branch above, these index straight into the raw waveform, since
+        # this runs directly on the 7987-pixel input (no FADC stage first).
+        digi_sum_channel_list = np.genfromtxt(
+            "ConfigFile/isolated_flower_seed_flower.list", dtype=int
+        ).tolist()
+        return digi_sum_channel_list
     else:
         raise ValueError(f"DigitalSumChannelList: camera_name {camera_name} not recognized")
