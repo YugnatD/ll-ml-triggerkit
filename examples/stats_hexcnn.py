@@ -16,17 +16,17 @@ import needed here. It even reloads the ``_history.npy`` sidecar if present.
     (find_threshold_for_target_rate, compute_statistics are TriggerChain
      methods, unchanged)
 
-Run it:
+Run it (quote the globs; repeat --condition for several NSB conditions, the
+first one is the reference):
 
-    python examples/stats_hexcnn.py GAMMA_GLOB NSB_GLOB MODEL.keras [OUTPUT_FOLDER]
+    python examples/stats_hexcnn.py MODEL.keras --condition medium "GAMMA_GLOB" "NSB_GLOB" [--output FOLDER] [--quick]
 
 MODEL.keras is a model saved by examples/train_hexcnn.py.
 """
 
-import glob
 import os
-import sys
 
+import stats_common
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
 
@@ -34,22 +34,19 @@ BASE_NAME = "simu"
 TARGET_RATE_HZ = 50_000
 SEED = 1337
 
-# Per-fold event caps. Each fold is a full independent pass, so these bound the
-# gamma / NSB events processed IN EACH FOLD (not the total across folds). None =
-# use everything. Gamma count is after the tel_id_only filter; NSB count is
-# source events (dataset augmentation off).
-MAX_GAMMA_EVENTS = None
-MAX_NSB_EVENTS = None
+# Event budget of every fold: (gamma_events, nsb_events), None = every event.
+FOLD_EVENTS = (None, None)
 
 # Cross-validation folds: a leakage detector. Each fold reindexes gamma by an
 # exact camera-rotation symmetry and NSB by a decorrelating reshuffle. If the
 # model learned the physics, efficiency + rate stay flat across folds; if it
 # cheated (fixed orientation, hot pixels, pedestal artefact), they shift -- and
 # that shift is what the per-fold report exposes. Arbitrary length: add/remove
-# rows freely. Set FOLD_SPECS = None to run fold-free.
+# rows freely.
 #
 # Each row is a dict; every key is optional and {} is the untouched reference
-# fold. Keys (defaults in brackets):
+# fold (run under every --condition, the others under the reference one only).
+# Keys (defaults in brackets):
 #   gamma_deg        [0]           camera rotation on the gamma rows. Must be an
 #                                  exact symmetry -- a multiple of 120 for this
 #                                  3-fold camera; other angles raise loudly
@@ -66,7 +63,7 @@ MAX_NSB_EVENTS = None
 # on un-rolled NSB -- the classes are no longer treated alike. Roll BOTH by the
 # same amount for the fair test: a time-translation-invariant trigger returns the
 # same gamma efficiency AND the same NSB rate as the reference fold.
-FOLD_SPECS = [
+FOLD_ROWS = [
     {},                                                # reference fold
     {"gamma_deg": 120, "nsb_kind": "rolled"},
     {"gamma_deg": 240, "nsb_kind": "shuffle"},
@@ -76,17 +73,14 @@ FOLD_SPECS = [
 
 
 def main():
-    if len(sys.argv) < 4:
-        sys.exit(f"usage: {sys.argv[0]} GAMMA_GLOB NSB_GLOB MODEL.keras [OUTPUT_FOLDER]")
-    gamma_files = sorted(glob.glob(sys.argv[1]))
-    nsb_files = sorted(glob.glob(sys.argv[2]))
-    model_path = sys.argv[3]
-    output_folder = sys.argv[4] if len(sys.argv) > 4 else "simu_sst1m_tel2_hexcnn"
-    if not gamma_files or not nsb_files:
-        sys.exit("no gamma or NSB files matched the given globs.")
+    parser = stats_common.argument_parser(__doc__.splitlines()[0], "simu_sst1m_tel2_hexcnn")
+    parser.add_argument("model_path", metavar="MODEL.keras", help="model saved by examples/train_hexcnn.py")
+    args = parser.parse_args()
+    model_path, output_folder = args.model_path, args.output
     if not os.path.exists(model_path):
-        sys.exit(f"model not found: {model_path}")
-    print(f"Found {len(gamma_files)} gamma files, {len(nsb_files)} NSB files.")
+        raise SystemExit(f"model not found: {model_path}")
+    conditions = stats_common.condition_files(args)
+    gamma_files, nsb_files = next(iter(conditions.values()))  # reference condition
 
     chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
     print(f"camera={chain.camera_name}  num_pixels={chain.num_pixels}  "
@@ -104,7 +98,7 @@ def main():
     tau, predicted_rate = chain.find_threshold_for_target_rate(
         target_rate_hz=TARGET_RATE_HZ,
         tolerance_hz=2,
-        N_event_esimate_threshold=25_000,
+        N_event_esimate_threshold=stats_common.threshold_events(args),
         batch_size=1024,
         nsb_skip_original_events=False,
         nsb_roll_copies=0,
@@ -116,8 +110,7 @@ def main():
 
     # All folds go into ONE statistics HDF5 (each event tagged with a `fold`
     # column, per-fold summaries in the /folds group). Point the report at that
-    # single file to compare metrics across folds. FOLD_SPECS=None -> a single
-    # fold-free pass.
+    # single file to compare metrics across folds.
     #
     # DATASET-level NSB augmentation stays OFF (nsb_roll_copies=0,
     # nsb_skip_original_events=False): each NSB event is yielded exactly once,
@@ -125,12 +118,13 @@ def main():
     # ("rolled", 50) fold = each NSB event rolled by 50, no original, no stacked
     # dataset roll). Every fold is a full pass over the same events -> identical
     # per-fold counts.
-    folds = None if FOLD_SPECS is None else make_rotation_folds(chain.geom, FOLD_SPECS, seed=SEED)
+    specs = stats_common.fold_specs(FOLD_ROWS, list(conditions), args.quick,
+                                    reference_events=FOLD_EVENTS, fold_events=FOLD_EVENTS)
+    folds = make_rotation_folds(chain.geom, specs, conditions, seed=SEED)
     chain.compute_statistics(
         base_name=BASE_NAME, folder=output_folder, batch_size=512,
         tel_id_only=1, nsb_roll_copies=0, nsb_skip_original_events=False,
-        ignore_errors=False, folds=folds,
-        max_gamma_events=MAX_GAMMA_EVENTS, max_nsb_events=MAX_NSB_EVENTS)
+        ignore_errors=False, folds=folds)
     print(f"Wrote per-event statistics under {output_folder}/")
 
 

@@ -53,11 +53,16 @@ _REGISTRATION_MODULES = (
     "triggerkit.training.metrics",
     "triggerkit.Stages.TDSCAN",
     "triggerkit.Stages.Shift",
+    "triggerkit.Stages.ScoreQuantizer",
+    "triggerkit.Stages.FADC",
+    "triggerkit.Stages.TrainableThreshold",
+    "triggerkit.Stages.OrMerge",
     "triggerkit.Stages.DigitalSum",
     "triggerkit.Stages.MovingAverage",
     "triggerkit.Loss.RateConstrainedBCE",
     "triggerkit.Metric.NSBRateHz",
     "triggerkit.Metric.TauMetric",
+    "keras_hexagdly",   # hex convolutions of the CNN bodies (optional dependency)
 )
 
 

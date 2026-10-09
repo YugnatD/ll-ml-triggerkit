@@ -24,7 +24,7 @@ the training log for exactly this reason).
 
 Usage
 -----
-    python load_and_use_timecoinc.py [path/to/model.keras]
+    python load_and_use_timecoinc.py "GAMMA_GLOB" "NSB_GLOB" [path/to/model.keras]
 
 Defaults to the model train_timecoinc.py just produced.
 """
@@ -32,7 +32,6 @@ import glob
 import sys
 
 import numpy as np
-import tensorflow as tf
 
 # Registers this script's own custom layers -- required before load_model(),
 # see the module docstring above. The import's side effect is all that
@@ -42,60 +41,70 @@ import timecoinc_layers  # noqa: F401
 import triggerkit.models as M
 from triggerkit.data import TriggerDataset
 
-MODEL_PATH = (sys.argv[1] if len(sys.argv) > 1 else
-             "trained_models/timecoinc_research_stats__model.keras")
 
-# ---------------------------------------------------------------------------
-# 1. Load. triggerkit.models.load_model() already calls
-#    register_custom_objects() internally, so this one call covers triggerkit's
-#    side; timecoinc_layers's classes are registered by the import above.
-# ---------------------------------------------------------------------------
-model = M.load_model(MODEL_PATH)
-print(f"loaded {MODEL_PATH}")
-print(f"  trainable params : {model.count_params()}")
-print(f"  input shape      : {model.input_shape}")
-print(f"  output shape     : {model.output_shape}")
+def main():
+    # Everything runs under main(): the data readers spawn processes that
+    # re-import this file.
+    if len(sys.argv) < 3:
+        sys.exit(f"usage: {sys.argv[0]} GAMMA_GLOB NSB_GLOB [MODEL.keras]")
+    MODEL_PATH = (sys.argv[3] if len(sys.argv) > 3 else
+                 "trained_models/timecoinc_research_stats__model.keras")
 
-# ---------------------------------------------------------------------------
-# 2. Pull a small batch of REAL events (a few gamma runs + the NSB run) to
-#    score, rather than synthetic noise -- this is the shape/dtype contract a
-#    caller actually needs to match: (B, 432, 50) float, R0Alpha waveforms.
-# ---------------------------------------------------------------------------
-ROOT = "/home/tanguy/Bureau/digicam-tdscan-triggering/simtelFileData"
-GAMMA = sorted(glob.glob(f"{ROOT}/gammas/NewSimHDF5/medium/*.hdf5"))[:2]
-NSB = [f"{ROOT}/NSB/NewSimHDF5/medium/"
-       "biascurve_run11110_TEL2_nsb120_tt300.0_dsum260.hdf5"]
+    # ---------------------------------------------------------------------------
+    # 1. Load. triggerkit.models.load_model() already calls
+    #    register_custom_objects() internally, so this one call covers triggerkit's
+    #    side; timecoinc_layers's classes are registered by the import above.
+    # ---------------------------------------------------------------------------
+    model = M.load_model(MODEL_PATH)
+    print(f"loaded {MODEL_PATH}")
+    print(f"  trainable params : {model.count_params()}")
+    print(f"  input shape      : {model.input_shape}")
+    print(f"  output shape     : {model.output_shape}")
 
-dataset = TriggerDataset(
-    GAMMA, NSB, batch_size=64, percent_validation=0.2, tel_id_only=1,
-    max_gamma_samples_train=256, max_nsb_samples_train=256,
-    load_ram=True, seed=0,
-)
-train_ds, _val_ds = dataset.train_val_datasets()
+    # ---------------------------------------------------------------------------
+    # 2. Pull a small batch of REAL events (a few gamma runs + the NSB run) to
+    #    score, rather than synthetic noise -- this is the shape/dtype contract a
+    #    caller actually needs to match: (B, 432, 50) float, R0Alpha waveforms.
+    # ---------------------------------------------------------------------------
+    GAMMA = sorted(glob.glob(sys.argv[1]))[:2]
+    NSB = sorted(glob.glob(sys.argv[2]))
+    if not GAMMA or not NSB:
+        sys.exit("no gamma or NSB files matched the given globs.")
 
-feats, y = next(iter(train_ds))
-# The dataset yields (B, 1, 432, 50); HexOverTime's SequentialBody pack expects
-# (B, 432, 50) -- same reshape train_timecoinc.py's own eval block uses.
-wf = np.asarray(feats["waveform"]).reshape(-1, 432, 50)
-y = np.asarray(y).ravel()
+    dataset = TriggerDataset(
+        GAMMA, NSB, batch_size=64, percent_validation=0.2, tel_id_only=1,
+        max_gamma_samples_train=256, max_nsb_samples_train=256,
+        load_ram=True, seed=0,
+    )
+    train_ds, _val_ds = dataset.train_val_datasets()
 
-# HexOverTime folds time into the batch (B*T images through the hex conv), so
-# score in chunks rather than the whole batch at once -- see HexOverTime's
-# docstring for the memory math (T=50 makes a batch of 256 already 12,800
-# images).
-CHUNK = 32
-scores = np.concatenate([
-    np.asarray(model(wf[i:i + CHUNK], training=False)).ravel()
-    for i in range(0, len(wf), CHUNK)
-])
+    feats, y = next(iter(train_ds))
+    # The dataset yields (B, 1, 432, 50); HexOverTime's SequentialBody pack expects
+    # (B, 432, 50) -- same reshape train_timecoinc.py's own eval block uses.
+    wf = np.asarray(feats["waveform"]).reshape(-1, 432, 50)
+    y = np.asarray(y).ravel()
 
-# ---------------------------------------------------------------------------
-# 3. Show it actually separates gamma (y=1) from NSB (y=0).
-# ---------------------------------------------------------------------------
-print(f"\nscored {len(scores)} events "
-     f"({int(y.sum())} gamma, {int((1 - y).sum())} nsb)")
-print(f"  mean score | gamma : {scores[y == 1].mean():.4f}")
-print(f"  mean score | nsb   : {scores[y == 0].mean():.4f}")
-print("\nfirst 10 events (true label, score):")
-for label, s in list(zip(y, scores))[:10]:
-    print(f"  {'gamma' if label else 'nsb  '}  {s:+.4f}")
+    # HexOverTime folds time into the batch (B*T images through the hex conv), so
+    # score in chunks rather than the whole batch at once -- see HexOverTime's
+    # docstring for the memory math (T=50 makes a batch of 256 already 12,800
+    # images).
+    CHUNK = 32
+    scores = np.concatenate([
+        np.asarray(model(wf[i:i + CHUNK], training=False)).ravel()
+        for i in range(0, len(wf), CHUNK)
+    ])
+
+    # ---------------------------------------------------------------------------
+    # 3. Show it actually separates gamma (y=1) from NSB (y=0).
+    # ---------------------------------------------------------------------------
+    print(f"\nscored {len(scores)} events "
+         f"({int(y.sum())} gamma, {int((1 - y).sum())} nsb)")
+    print(f"  mean score | gamma : {scores[y == 1].mean():.4f}")
+    print(f"  mean score | nsb   : {scores[y == 0].mean():.4f}")
+    print("\nfirst 10 events (true label, score):")
+    for label, s in list(zip(y, scores))[:10]:
+        print(f"  {'gamma' if label else 'nsb  '}  {s:+.4f}")
+
+
+if __name__ == "__main__":
+    main()

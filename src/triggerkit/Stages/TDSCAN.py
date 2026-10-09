@@ -1,13 +1,12 @@
-import os
 import math
 import numpy as np
 import tensorflow as tf
-import csv
 from keras.saving import register_keras_serializable
 from ctapipe.instrument import CameraGeometry
 import astropy.units as u
 import hashlib
 
+from triggerkit.camera import sst1m
 from triggerkit.Helper.Quantize import (
     fixed_point_clip_int,
     fixed_point_from_int,
@@ -397,7 +396,7 @@ class TDSCAN(tf.keras.layers.Layer):
     def generate_output_geometry(self):
         if self.input_geometry is None:
             return None
-        if self.input_geometry.name == "DigiCam" or self.input_geometry.name == "DigiCam_R0Alpha" or self.input_geometry.name == "UNKNOWN-7987PX":
+        if self.input_geometry.name == "DigiCam" or self.input_geometry.name == "DigiCam_R0Alpha":
             return self.input_geometry
         raise ValueError(f"TDSCAN: camera '{self.input_geometry.name}' not recognized")
 
@@ -1316,18 +1315,7 @@ def getTDSCANNeighbors(eps_xy, camera_name, n_pixels):
     if eps_xy == 0:
         # raise ValueError("eps_xy must be >= 1 for TDSCAN neighbors.")
         return [[i] for i in range(n_pixels)]  # each pixel is its own neighbor
-    # Load from CSV
     if camera_name == "DigiCam" or camera_name == "DigiCam_R0Alpha":
-        csv_file = 'ConfigFile_SST1M/CTA_SST1M_Pixels_info_epsilon_' + str(eps_xy) + '.csv'
-    elif camera_name == "UNKNOWN-7987PX":
-        csv_file = 'ConfigFile/CTA_LST_Pixels_info_epsilon_' + str(eps_xy) + '.csv'
-    else:
-        raise ValueError(f"Unsupported camera geometry: {camera_name}")
-    if not os.path.exists(csv_file):
-        raise FileNotFoundError(f"TDSCAN neighbor file not found for eps_xy={eps_xy}: {csv_file}")
-    with open(csv_file, 'r') as f:
-        reader = csv.reader(f)
-        # skip the header
-        next(reader)
-        neighbors = [list(map(int, row)) for row in reader]
-    return neighbors
+        # Built from camera_config.cfg, see triggerkit.camera.sst1m.
+        return sst1m.tdscan_neighbors(eps_xy).tolist()
+    raise ValueError(f"Unsupported camera {camera_name}: only SST-1M (DigiCam) is supported")

@@ -7,9 +7,9 @@ gamma efficiency vs NSB rate, effective area, per-npe / per-energy efficiency, e
 The report step reads the per-event statistics HDF5 files produced by the stat
 scripts -- it does NOT touch raw simtel data or TensorFlow. So the pipeline is:
 
-    1. examples/stats_tdscan.py  GAMMA NSB simu_sst1m_tel2_tdscan     # writes .h5
-    2. examples/stats_hexcnn.py  GAMMA NSB [W] simu_sst1m_tel2_hexcnn # writes .h5
-    3. examples/stats_report.py                                       # this script
+    1. examples/stats_patch7.py --condition medium GAMMA NSB         # writes .h5
+    2. examples/stats_tdscan.py --condition medium GAMMA NSB         # writes .h5
+    3. examples/stats_report.py simu_sst1m_tel2_patch7 simu_sst1m_tel2_tdscan  # this script
 
 A "config" is an ordered list of ``(stage_name, params)`` tuples describing a
 trigger chain; StatPlotter matches each config to the .h5 file whose stored chain
@@ -20,7 +20,7 @@ scripts) to match your own runs, or every config lands under "Skipped Items".
 
 Run it:
 
-    python examples/stats_report.py
+    python examples/stats_report.py STAT_FOLDER [STAT_FOLDER ...]
 """
 
 import sys
@@ -29,15 +29,17 @@ from triggerkit.Statistics.StatPlotter import StatPlotter
 
 TARGET_RATE_HZ = 50_000.0
 
-# Folders holding the .h5 stat files. These are the outputs of the cross-
-# validation run (stats_patch7.py + stats_tdscan.py, 10 folds each) copied into
-# examples/results/. Point this at your own OUTPUT_FOLDER(s) if you re-run.
-STAT_FOLDERS = sys.argv[1:] or ["results"]
+# Folders holding the .h5 stat files (the --output of the stats scripts).
+STAT_FOLDERS = sys.argv[1:]
 OUTPUT_DIR = "trigger_report"
 
-# --- Configs (match the actual cross-validation runs in results/) ------------
-# These mirror the two .h5 files in examples/results/. The threshold values are
-# the frozen tau each stat script printed (tuned once to ~50 kHz NSB).
+# The fold the report is drawn from: the reference fold of the reference
+# --condition given to the stats scripts ("rot0_original_<condition name>").
+FOLD = "rot0_original_medium"
+
+# --- Configs ------------------------------------------------------------------
+# Examples: the threshold values are the frozen tau each stats script printed
+# (tuned once to ~50 kHz NSB); replace them with the ones of your own runs.
 #
 # The real patch7 telescope trigger (digital_sum patch7 + threshold, no TDSCAN).
 CONFIG_PATCH7 = [
@@ -82,9 +84,11 @@ LEGENDS = ["PATCH7", "TDSCAN Pow2 xy1,t2", "TDSCAN INQ4 wPow2"]
 
 
 def main():
+    if not STAT_FOLDERS:
+        sys.exit(f"usage: {sys.argv[0]} STAT_FOLDER [STAT_FOLDER ...]")
     plotter = StatPlotter(base_reference_config=BASE_CONFIG,
                           stat_folder=STAT_FOLDERS,
-                          fold="rot0_original")
+                          fold=FOLD)
 
     score_threshold, predicted_rate_hz = plotter.find_score_threshold_for_target_rate(
         TARGET_RATE_HZ)

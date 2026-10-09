@@ -1,7 +1,7 @@
 """Cross-validation (leakage) report over per-fold statistics files.
 
-The fold stat scripts (``stats_tdscan.py`` / ``stats_hexcnn.py`` with a
-``FOLD_SPECS`` list) write ONE HDF5 per run holding every fold: a ``/folds``
+The stat scripts (``stats_patch7.py`` / ``stats_tdscan.py`` / ``stats_hexcnn.py``)
+write ONE HDF5 per run holding every fold: a ``/folds``
 group with per-fold counts/rate/efficiency, and a ``fold`` column in ``/events``.
 Every fold is evaluated at the SAME frozen ``tau``. This script reads the
 ``/folds`` group and shows, per model (grouped by the stored trigger chain), how

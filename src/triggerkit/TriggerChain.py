@@ -147,12 +147,10 @@ class TriggerChain:
     if not hasattr(self, 'num_samples'):
         raise ValueError("Could not determine number of samples from the simtel file.")
     # open the necessary file depending on the camera type to get the sampling rate
-    if self.camera_name == "UNKNOWN-7987PX":
-        self.sampling_rate_hz = 1e9  # 1 GHz for LST
-    elif self.camera_name == "DigiCam" or self.camera_name == "DigiCam_R0Alpha":
+    if self.camera_name == "DigiCam" or self.camera_name == "DigiCam_R0Alpha":
         self.sampling_rate_hz = 250e6  # 250 MHz for sst1m
     else:
-        raise ValueError(f"Unknown camera name: {self.camera_name}")
+        raise ValueError(f"Unsupported camera {self.camera_name}: only SST-1M (DigiCam) is supported")
     self.window_size = (1.0 / self.sampling_rate_hz) * self.num_samples  # in seconds
     self.input_layer = tf.keras.Input(shape=(self.num_pixels, self.num_samples), dtype=tf.uint16, name="waveform")
     self.input_baseline = tf.keras.Input(shape=(self.num_pixels,), dtype=tf.int32, name="pedestal")
@@ -309,6 +307,10 @@ class TriggerChain:
     self.model_path = model_path
     if self.model_path is not None and os.path.exists(self.model_path):
         print(f"Loading model from {self.model_path}...")
+        # Register every triggerkit custom class first (CNN bodies, losses,
+        # metrics...): the dict below only covers the original trigger stages.
+        from triggerkit.models import register_custom_objects
+        register_custom_objects()
         self.model = tf.keras.models.load_model(self.model_path, custom_objects={
             'TDSCAN': TDSCAN,
             'TrainableThreshold': TrainableThreshold,

@@ -61,9 +61,9 @@ def make_body():
         tf.keras.layers.Conv3D(8, (3, 1, 1), strides=(2, 1, 1), padding="same", name="temporal_2"),
         tf.keras.layers.ReLU(),
         TimeMean(),                                                    # (B,H,W,C)
-        hgly.Conv2d(8, 16, kernel_size=2, stride=2, bias=True, share_neighbors=False, name="spatial_0"),
+        hgly.Conv2d(16, kernel_size=2, strides=2, use_bias=True, share_neighbors=False, name="spatial_0"),
         tf.keras.layers.ReLU(),
-        hgly.Conv2d(16, 32, kernel_size=2, stride=2, bias=True, share_neighbors=False, name="spatial_2"),
+        hgly.Conv2d(32, kernel_size=2, strides=2, use_bias=True, share_neighbors=False, name="spatial_2"),
         tf.keras.layers.ReLU(),
         GlobalHexMean(),                                               # (B,C)
     ])

@@ -4,6 +4,8 @@ import astropy.units as u
 import tensorflow as tf
 from keras.saving import register_keras_serializable
 
+from triggerkit.camera import sst1m
+
 @tf.keras.utils.register_keras_serializable(package="Trigger")
 class FADC(tf.keras.layers.Layer):
     """
@@ -44,14 +46,7 @@ class FADC(tf.keras.layers.Layer):
     def generate_output_geometry(self):
         if self.input_geometry.name != "DigiCam": # SST-1M equivalent name
             raise ValueError("FADC only supports DigiCam geometry.")
-        data = np.loadtxt(
-            "ConfigFile_SST1M/CTA_SST1M_Pixels_info_shrink.csv",
-            delimiter=",",
-            skiprows=1,
-            usecols=(1, 2),
-            dtype=float,
-        )
-        pixel_x, pixel_y = data[:, 0], data[:, 1]
+        pixel_x, pixel_y = sst1m.patch_positions().T
         output_geometry = CameraGeometry(
             name=self.input_geometry.name,
             pix_id=np.arange(len(pixel_x)),
@@ -136,12 +131,7 @@ class FADC(tf.keras.layers.Layer):
         return cls(input_geometry=input_geometry, **config)
     
 def FADCList():
-    digi_sum_channel_list = []
-    with open("ConfigFile_SST1M/CTA_SST1M_Pixels_info_trigger.csv") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                sum_channel = np.fromstring(line, sep=',', dtype=int)
-                sum_patch = sum_channel.reshape(-1, 3).tolist()
-                digi_sum_channel_list.append(sum_patch)
-    return digi_sum_channel_list
+    """For each patch, the pixel triplets of its patch7 cluster, the patch's own triplet first
+    (only that one is used by the FADC). Built from camera_config.cfg, see triggerkit.camera.sst1m."""
+    triplets = sst1m.patch_triplets()
+    return [[triplets[patch].tolist() for patch in cluster] for cluster in sst1m.patch7_clusters()]

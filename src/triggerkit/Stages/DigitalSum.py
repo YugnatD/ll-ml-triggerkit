@@ -1,21 +1,21 @@
 import os
-import numpy as np
 import tensorflow as tf
 from ctapipe.instrument import CameraGeometry
 import astropy.units as u
 
 from keras.saving import register_keras_serializable
 
+from triggerkit.camera import sst1m
+
 @tf.keras.utils.register_keras_serializable(package="Trigger")
 class DigitalSum(tf.keras.layers.Layer):
-    def __init__(self, input_geometry: CameraGeometry, neighbors, mode="flower", threshold_flower=None, **kwargs):
+    def __init__(self, input_geometry: CameraGeometry, neighbors, mode="patch7", threshold_flower=None, **kwargs):
         super().__init__(**kwargs)
         self.mode = mode
         self.input_geometry = input_geometry
-        # Matches the legacy TriggerChainPy DigitalSum stage: for the LST
-        # flower mode, the module sum is immediately binarized in this same
-        # stage (digital_sum_result > threshold_flower), not by a separate
-        # downstream stage.
+        # Optional threshold applied in this same stage (sum > threshold_flower).
+        # The name comes from the former LST "flower" mode; it is kept because
+        # it is part of the saved model configs and of the stats file names.
         self.threshold_flower = threshold_flower
 
         # Keep a pure-Python structure for serialization
@@ -30,9 +30,6 @@ class DigitalSum(tf.keras.layers.Layer):
             while len(n) < max_length:
                 n.append(-1)
 
-        # generate_output_geometry (LST branch) needs self.neighbors to build
-        # each output module's centroid position, so it must run after the
-        # normalization above.
         self.output_geometry = self.generate_output_geometry()
 
         # Works if all rows have same length (dense)
@@ -43,27 +40,6 @@ class DigitalSum(tf.keras.layers.Layer):
             if self.mode != "patch7":
                 raise ValueError(f"DigitalSum: mode {self.mode} not recognized for camera {self.input_geometry.name}")
             return self.input_geometry
-        elif self.input_geometry.name == "UNKNOWN-7987PX":
-            if self.mode != "flower":
-                raise ValueError(f"DigitalSum: mode {self.mode} not recognized for camera {self.input_geometry.name}")
-            # LST flower/module grouping: each output channel is the sum of a
-            # fixed set of raw pixels (self.neighbors, no -1 padding here since
-            # every LST flower module has exactly 7 member pixels); place each
-            # module at the centroid of its member pixels for display.
-            pix_x = self.input_geometry.pix_x.to_value(u.m)
-            pix_y = self.input_geometry.pix_y.to_value(u.m)
-            pix_area = self.input_geometry.pix_area.to_value(u.m ** 2)
-            module_x = np.array([pix_x[idxs].mean() for idxs in self.neighbors])
-            module_y = np.array([pix_y[idxs].mean() for idxs in self.neighbors])
-            module_area = np.array([pix_area[idxs].sum() for idxs in self.neighbors])
-            return CameraGeometry(
-                name=self.input_geometry.name,
-                pix_id=np.arange(len(self.neighbors)),
-                pix_x=module_x * u.m,
-                pix_y=module_y * u.m,
-                pix_area=module_area * u.m**2,
-                pix_type=self.input_geometry.pix_type,
-            )
         else:
             raise ValueError(f"DigitalSum: camera {self.input_geometry.name} not recognized")
         
@@ -151,46 +127,8 @@ class DigitalSum(tf.keras.layers.Layer):
     
 def DigitalSumChannelList(camera_name="DigiCam"):
     if camera_name == "DigiCam" or camera_name == "DigiCam_R0Alpha":
-        with open("ConfigFile_SST1M/CTA_SST1M_Pixels_info_trigger.csv") as f:
-            digi_sum_channel_list = [
-                np.fromstring(line.strip(), sep=',', dtype=int)
-                for line in f
-                if line.strip()
-            ]
-            # now we have : [[0,2,3,1,6,7,4,9,10,8,16,17], [1,6,7,0,2,3,5,13,14,8,16,17,15,26,27], ...]
-            # we need to recreate the patches : [[[0,2,3],[1,6,7],[4,9,10],[8,16,17], [1,6,7],[0,2,3],...], ...]
-            digi_sum_channel_list = [
-                np.array(sum_channel).reshape(-1, 3).tolist()
-                for sum_channel in digi_sum_channel_list
-            ]
-            # we need to generate a list to compute the sum for each patch (summ of the 7 triplet sums)
-            # so we need to assign each list to a patch so [0,2,3] -> 0, [1,6,7] -> 1, [4,9,10] -> 2, [8,16,17] -> 3
-            # then we know that for the first sum we need to use triplet 0,1,2,3, for the second sum we need to use triplet 4,5,6,7, etc
-            # start by making a list of the first channel of each triplet
-            list_first_triplet_channel = []
-            for patch_list in digi_sum_channel_list:
-                list_first_triplet_channel.append(patch_list[0]) # ex [1,6,7]
-            # print(list_first_triplet_channel)
-            # now create a mapping from triplet index to patch index
-            converted_digi_sum_list = []
-            for patch_sum_channel in digi_sum_channel_list:
-                triplet_indices = []
-                for triplet in patch_sum_channel:
-                    # search the index of triplet in list_first_triplet_channel
-                    index = list_first_triplet_channel.index(triplet)
-                    # print(f"Triplet: {triplet}, Index: {index}")
-                    triplet_indices.append(index)
-                converted_digi_sum_list.append(triplet_indices)
-            digi_sum_channel_list = converted_digi_sum_list
-            return digi_sum_channel_list
-    elif camera_name == "UNKNOWN-7987PX":
-        # LST "flower" module grouping: each row is the 7 raw pixel indices
-        # (0..7986) physically summed into one module -- unlike the SST-1M
-        # branch above, these index straight into the raw waveform, since
-        # this runs directly on the 7987-pixel input (no FADC stage first).
-        digi_sum_channel_list = np.genfromtxt(
-            "ConfigFile/isolated_flower_seed_flower.list", dtype=int
-        ).tolist()
-        return digi_sum_channel_list
+        # The patches of the patch7 cluster of each patch, the patch itself first
+        # (camera_config.cfg, see triggerkit.camera.sst1m).
+        return sst1m.patch7_clusters()
     else:
         raise ValueError(f"DigitalSumChannelList: camera_name {camera_name} not recognized")

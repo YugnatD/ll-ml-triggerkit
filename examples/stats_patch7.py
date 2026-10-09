@@ -12,21 +12,17 @@ layer -- ``tau`` is the only free parameter, tuned once to the target NSB rate
 and frozen. Same threshold-tuning / statistics / fold plumbing as
 ``stats_tdscan.py``; only the body differs (digital_sum instead of tdscan).
 
-Run it:
+Run it (quote the globs; repeat --condition for several NSB conditions, the
+first one is the reference):
 
-    python examples/stats_patch7.py GAMMA_GLOB NSB_GLOB [OUTPUT_FOLDER]
+    python examples/stats_patch7.py --condition medium "GAMMA_GLOB" "NSB_GLOB" [--output FOLDER] [--quick]
 
-The output HDF5 lands in OUTPUT_FOLDER (default: simu_sst1m_tel2_patch7).
-
-Note: DigitalSumChannelList reads ConfigFile_SST1M/CTA_SST1M_Pixels_info_trigger.csv
-via a RELATIVE path, so run this from a directory where that file is reachable
-(same requirement as the sandbox).
+The output HDF5 lands in --output (default: simu_sst1m_tel2_patch7).
 """
 
-import glob
 import os
-import sys
 
+import stats_common
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
 
@@ -34,9 +30,6 @@ from triggerkit.augment import make_rotation_folds
 BASE_NAME = "simu_cross"
 TARGET_RATE_HZ = 50_000
 SEED = 1337
-
-TOTAL_GAMMAS_EVENTS = 1_000_000
-TOTAL_NSB_EVENTS = 400_000
 
 # Threshold seed / sharpness. tau is retuned to TARGET_RATE_HZ below; TAU_INIT is
 # only the starting point. binary_output=True -> hard fire/no-fire decision.
@@ -49,66 +42,18 @@ TAU_TEMP = 10.0
 FADC = False
 SUBTRACT_VALUE = None
 
-# Cross-validation folds (leakage detector -- see triggerkit.augment). For the
-# patch7 trigger there is nothing learned, so folds are a pure consistency check:
-# gamma efficiency MUST be invariant under a camera-rotation symmetry, and the
-# NSB rate MUST be invariant under an NSB reshuffle. Any drift here is a bug in
-# the geometry / patch map, not model leakage. Set FOLD_SPECS = None to run a
-# single plain (fold-free) pass.
-#
-# Each row is a dict; every key is optional and {} is the untouched reference
-# fold. Keys: gamma_deg (0), gamma_time_shift (0), nsb_kind ("original"),
-# nsb_param (None), nsb_time_shift (0), name (auto). An unknown key raises. See
-# stats_tdscan.py for the full description of each key.
-#
-# patch7 has no temporal filter with an edge to trip over, so the time-roll folds
-# below are the CONTROL for the TDSCAN ones: patch7 efficiency and rate should be
-# flat under every roll. Any drift TDSCAN shows and patch7 does not is TDSCAN's.
-#
-# NOTE: kept IDENTICAL to examples/stats_tdscan.py so the two runs are directly
-# comparable fold-by-fold. If you change the folds in one, change both.
-FOLD_SPECS = [
-    # --- rotation symmetry ---------------------------------------------------
-    {},                                                       # reference fold
-    {"gamma_deg": 120},
-    {"gamma_deg": 240},
-    # --- NSB pixel transforms ------------------------------------------------
-    {"nsb_kind": "rolled",  "nsb_param": 1},
-    {"nsb_kind": "rolled",  "nsb_param": 42},
-    {"nsb_kind": "shuffle", "nsb_param": 2024},
-    # --- mixes ---------------------------------------------------------------
-    {"gamma_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
-    {"gamma_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
-    # --- temporal position: gammas only (the UNFAIR half, kept for reference) -
-    {"gamma_time_shift": 2},
-    {"gamma_time_shift": 5},
-    # --- temporal position: BOTH classes rolled (the fair test) ---------------
-    {"gamma_time_shift": 2, "nsb_time_shift": 2},
-    {"gamma_time_shift": 5, "nsb_time_shift": 5},
-    # --- temporal position: NSB only (isolates the noise side) ---------------
-    {"nsb_time_shift": 5, "name": "nsb_only_troll5"},
-    {"nsb_time_shift": 2, "name": "nsb_only_troll2"},
-]
-
-n_folds = len(FOLD_SPECS) if FOLD_SPECS is not None else 1
-
-# Per-fold event caps (each fold is a full independent pass; these bound events
-# processed IN EACH FOLD). None = use everything.
-MAX_GAMMA_EVENTS = TOTAL_GAMMAS_EVENTS // n_folds
-MAX_NSB_EVENTS = TOTAL_NSB_EVENTS // n_folds
+# Cross-validation folds: stats_common.STANDARD_FOLDS, identical to
+# stats_tdscan.py so the two runs compare fold by fold. patch7 learns nothing,
+# so they are a pure consistency check: gamma efficiency must not change under
+# a camera rotation, nor the NSB rate under an NSB reshuffle or time roll.
+FOLD_ROWS = stats_common.STANDARD_FOLDS
 
 
 def main():
-    if len(sys.argv) < 3:
-        sys.exit(f"usage: {sys.argv[0]} GAMMA_GLOB NSB_GLOB [OUTPUT_FOLDER]")
-    gamma_files = sorted(glob.glob(sys.argv[1]))
-    nsb_files = sorted(glob.glob(sys.argv[2]))
-    output_folder = sys.argv[3] if len(sys.argv) > 3 else "simu_sst1m_tel2_patch7"
-    if not gamma_files or not nsb_files:
-        sys.exit("no gamma or NSB files matched the given globs.")
-    print(f"Found {len(gamma_files)} gamma files, {len(nsb_files)} NSB files.")
+    args = stats_common.argument_parser(__doc__.splitlines()[0], "simu_sst1m_tel2_patch7").parse_args()
+    conditions = stats_common.condition_files(args)
+    gamma_files, nsb_files = next(iter(conditions.values()))  # reference condition
+    output_folder = args.output
 
     # --- The real patch7 trigger, built directly on the chain (no body) ------
     # digital_sum(patch7) needs no learned weights, so there is nothing to build
@@ -131,7 +76,7 @@ def main():
     tau, predicted_rate = chain.find_threshold_for_target_rate(
         target_rate_hz=TARGET_RATE_HZ,
         tolerance_hz=2,
-        N_event_esimate_threshold=25_000,
+        N_event_esimate_threshold=stats_common.threshold_events(args),
         batch_size=1024,
     )
     print(f"tau={tau}  predicted_rate={predicted_rate} Hz (frozen for all folds)")
@@ -142,17 +87,17 @@ def main():
     # All folds go into ONE statistics HDF5 (each event tagged with a `fold`
     # column, per-fold summaries in the /folds group). The pixel permutation is
     # applied to the raw waveform + pedestal before the digital sum, so folds
-    # work here exactly as for TDSCAN. FOLD_SPECS=None -> a single fold-free pass.
+    # work here exactly as for TDSCAN.
     #
     # DATASET-level NSB augmentation stays OFF (nsb_roll_copies=0,
     # nsb_skip_original_events=False): each NSB event is yielded exactly once,
     # untouched, so the fold's own nsb_index is the ONLY NSB transform.
-    folds = None if FOLD_SPECS is None else make_rotation_folds(chain.geom, FOLD_SPECS, seed=SEED)
+    specs = stats_common.fold_specs(FOLD_ROWS, list(conditions), args.quick)
+    folds = make_rotation_folds(chain.geom, specs, conditions, seed=SEED)
     chain.compute_statistics(
         base_name=BASE_NAME, folder=output_folder, batch_size=512,
         tel_id_only=1, nsb_roll_copies=0, nsb_skip_original_events=False,
-        ignore_errors=False, folds=folds,
-        max_gamma_events=MAX_GAMMA_EVENTS, max_nsb_events=MAX_NSB_EVENTS)
+        ignore_errors=False, folds=folds)
     print(f"Wrote per-event statistics under {output_folder}/")
 
 

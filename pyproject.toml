@@ -26,11 +26,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # Hex CNN bodies (models/hexcnn.py, SequentialBody hex layers).
-hexcnn = ["keras-hexagdly"]
+hexcnn = ["keras-hexagdly>=0.4"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-triggerkit = ["**/*.json"]
+triggerkit = ["**/*.json", "camera/*.cfg"]

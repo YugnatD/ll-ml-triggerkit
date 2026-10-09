@@ -68,14 +68,12 @@ def hex3d_hybrid_layers(
         "time_mean",
     ]
 
-    prev_c = temporal_channels
     for i, out_c in enumerate(spatial_channels):
         layers.append(
             hgly.Conv2d(
-                prev_c, out_c, kernel_size=2, stride=2, bias=True,
+                out_c, kernel_size=2, strides=2, use_bias=True,
                 share_neighbors=False, name=f"spatial_{2 * i}"))
         layers.append(keras.layers.ReLU())
-        prev_c = out_c
 
     layers.append("global_hex_mean")
     return layers
