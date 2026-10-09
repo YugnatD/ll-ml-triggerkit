@@ -240,6 +240,7 @@ class StatPlotter:
         float_rtol: float = 1e-5,
         h5_chunk_rows: int = 200_000,
         fold: Optional[str] = None,
+        style: str = "report",
     ):
         # Accept either a single folder string or a list of folders.
         folders = [stat_folder] if isinstance(stat_folder, str) else list(stat_folder)
@@ -257,6 +258,14 @@ class StatPlotter:
         # ask for a specific fold falls back to this, not to "aggregate everything".
         self._default_fold = fold
 
+        # style="report" (default): the report look (large fonts, titles, tinted
+        # background). style="paper": figures for a publication -- no titles
+        # (the caption replaces them), white background, one-column size,
+        # smaller fonts and lines, fonts embedded in PDF output. Only the saved
+        # single-plot files change; the section titles of the PDF report stay.
+        if style not in ("report", "paper"):
+            raise ValueError(f"style must be 'report' or 'paper', got {style!r}")
+        self.style = style
         self.float_atol = float_atol
         self.float_rtol = float_rtol
         self.h5_chunk_rows = int(h5_chunk_rows)
@@ -1918,6 +1927,7 @@ class StatPlotter:
             plt.xlim(max(lo, 1e-3), hi)
             self._report_style_current_figure(title=title)
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2023,6 +2033,7 @@ class StatPlotter:
             plt.legend(loc="best", fontsize=9)
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2063,6 +2074,7 @@ class StatPlotter:
             plt.legend(loc="lower right", fontsize=9)
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2113,6 +2125,7 @@ class StatPlotter:
             plt.legend(loc="best", fontsize=9)
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2154,6 +2167,7 @@ class StatPlotter:
             plt.title(f"Trigger efficiency map (E × impact distance)\n{label}; {self._rate_suffix(strategy.get('trigger_rate_hz', 0.0))}")
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2185,6 +2199,7 @@ class StatPlotter:
             plt.title("n_pe vs Energy (all gamma events)")
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2287,6 +2302,7 @@ class StatPlotter:
                     if presentation_svg else None
                 ),
             )
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2384,8 +2400,56 @@ class StatPlotter:
                     f"Failed to write SVG plot ({exc!r}); PNG still available.",
                 )
 
+    _PAPER_RC = {
+        "figure.figsize": (6.0, 3.9),
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.format": "pdf",
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+        "axes.facecolor": "white",
+        "axes.edgecolor": "black",
+        "axes.linewidth": 0.8,
+        "axes.titlesize": 10,
+        "axes.labelsize": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.alpha": 0.3,
+        "grid.linestyle": ":",
+        "grid.linewidth": 0.5,
+        "legend.frameon": False,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "lines.linewidth": 1.3,
+        "lines.markersize": 3.5,
+        "errorbar.capsize": 1.5,
+    }
+
+    def _figsize(self, default: Tuple[float, float]) -> Tuple[float, float]:
+        """Figure size of a plot: its own default, or the paper size in style="paper"."""
+        return self._PAPER_RC["figure.figsize"] if self.style == "paper" else default
+
+    @contextmanager
+    def _paper_style_context(self):
+        """rcParams of style="paper"; does nothing in the report style."""
+        if self.style != "paper":
+            yield
+            return
+        with plt.rc_context(self._PAPER_RC):
+            yield
+
     @contextmanager
     def _report_style_context(self):
+        if self.style == "paper":
+            with self._paper_style_context():
+                yield
+            return
         with plt.rc_context({
             "figure.figsize": (11.5, 7.0),
             "figure.facecolor": "#fbfbf8",
@@ -2414,8 +2478,22 @@ class StatPlotter:
         }):
             yield
 
+    def _apply_title_policy(self, fig: Optional["plt.Figure"] = None) -> None:
+        """Clear every axes title and the suptitle in the paper style."""
+        if self.style != "paper":
+            return
+        fig = fig if fig is not None else plt.gcf()
+        for ax in fig.get_axes():
+            for loc in ("left", "center", "right"):
+                ax.set_title("", loc=loc)
+        if fig._suptitle is not None:
+            fig._suptitle.set_text("")
+
     def _report_style_current_figure(self, title: Optional[str] = None) -> None:
         fig = plt.gcf()
+        if self.style == "paper":
+            self._apply_title_policy(fig)
+            return
         for ax in fig.get_axes():
             try:
                 ax.spines["top"].set_visible(False)
@@ -2434,6 +2512,7 @@ class StatPlotter:
                 ax.grid(True, which="minor", alpha=0.08, linestyle=":")
             except Exception:
                 pass
+        self._apply_title_policy(fig)
 
     def _report_render_queued_plot(
         self,
@@ -2471,6 +2550,7 @@ class StatPlotter:
             )
             self._report_style_current_figure(title=title)
             self._report_stash_vector_figure(filename)
+            self._apply_title_policy()
             plt.gcf().savefig(filename, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -2732,6 +2812,7 @@ class StatPlotter:
             self._draw_cross_validation(rows, n_sigma=n_sigma)
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
             plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
             if show:
                 plt.show()
@@ -3215,6 +3296,7 @@ class StatPlotter:
                     )
                     self._report_style_current_figure()
                     self._report_stash_vector_figure(full_path)
+                    self._apply_title_policy()
                     plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
                     if show:
                         plt.show()
@@ -3895,7 +3977,7 @@ class StatPlotter:
         self.target_rate_hz = target_rate_hz
         self.score_threshold = score_threshold
 
-        plt.figure(figsize=(17, 7), constrained_layout=True)
+        plt.figure(figsize=self._figsize((17, 7)), constrained_layout=True)
         counts_line = self._format_counts_line()
         base_title = self._generate_title_config_text(
             self.base_reference_config,
@@ -3944,7 +4026,7 @@ class StatPlotter:
         self.target_rate_hz = target_rate_hz
         self.score_threshold = score_threshold
 
-        plt.figure(figsize=(17, 7), constrained_layout=True)
+        plt.figure(figsize=self._figsize((17, 7)), constrained_layout=True)
         counts_line = self._format_counts_line()
         base_title = self._generate_title_config_text(
             self.base_reference_config,
@@ -4195,13 +4277,15 @@ class StatPlotter:
             label += f"thr {self._format_label_value(threshold_override)}; "
         return label.strip("; ")
 
-    @staticmethod
-    def _rate_suffix(rate_hz) -> str:
+    def _rate_suffix(self, rate_hz) -> str:
         """Format the realized NSB trigger rate to append next to a custom label."""
         try:
-            return f"rate={float(rate_hz):.1f}Hz"
+            rate_hz = float(rate_hz)
         except (TypeError, ValueError):
             return ""
+        if self.style == "paper":
+            return f"{rate_hz / 1e3:.1f} kHz"
+        return f"rate={rate_hz:.1f}Hz"
 
     def generate_label_text(
         self,
@@ -4219,8 +4303,8 @@ class StatPlotter:
             include_threshold=True,
         )
         if prefix:
-            return f"{prefix}; rate={trigger_rate:.1f}Hz"
-        return f"rate={trigger_rate:.1f}Hz"
+            return f"{prefix}; {self._rate_suffix(trigger_rate)}"
+        return self._rate_suffix(trigger_rate)
 
     def _generate_title_config_text(
         self,
@@ -4333,6 +4417,10 @@ class StatPlotter:
             plotter.showPlot(plot_type="effective_area", filename="aeff.png", emin_tev=0.01, emax_tev=50, nbins=25)
             plotter.showPlot(plot_type="effective_area_counts", filename="aeff_counts.png", emin_tev=0.01, emax_tev=50, nbins=25)
         """
+        with self._paper_style_context():
+            return self._show_plot_impl(filename, show, location, plot_type, **plot_kwargs)
+
+    def _show_plot_impl(self, filename, show, location, plot_type, **plot_kwargs):
         # apply the sanity check before plotting
         if not self.sanity_check_configs([item["config"] for item in getattr(self, "_queued_plots", [])]):
             print("Sanity check failed: configurations have different number of events or n_pe distributions.")
@@ -4387,6 +4475,7 @@ class StatPlotter:
         except Exception:
             pass
 
+        self._apply_title_policy(fig)
         if filename is not None:
             fig.savefig(filename, bbox_inches="tight", dpi=300)
         if show:
@@ -4412,7 +4501,7 @@ class StatPlotter:
 
         edges = np.linspace(range[0], range[1], bins)
 
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Npe Distribution - Config: {title_config}")
         plt.xlabel("Npe")
         plt.ylabel("Number of Events")
@@ -4451,7 +4540,7 @@ class StatPlotter:
 
         edges = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi + 1e-3), bins)
 
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Npe Distribution - Base Config: {self.base_reference_config}")
         plt.xlabel("Npe")
         plt.ylabel("Number of Events")
@@ -4485,7 +4574,7 @@ class StatPlotter:
 
         edges = np.logspace(np.log10(0.005), np.log10(50), bins)
 
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Energy Distribution - Config: {title_config}")
         plt.xlabel("Energy (TeV)")
         plt.ylabel("Number of Events")
@@ -4524,7 +4613,7 @@ class StatPlotter:
 
         edges = np.logspace(np.log10(max(lo, 1e-4)), np.log10(hi + 1e-4), bins)
 
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Energy Distribution - Base Config: {self.base_reference_config}")
         plt.xlabel("Energy (TeV)")
         plt.ylabel("Number of Events")
@@ -4769,7 +4858,7 @@ class StatPlotter:
         self._efficiency_vs_rate_metric_bins = metric_bins
         self._efficiency_vs_rate_max_points = max_points
 
-        plt.figure(figsize=(11, 6))
+        plt.figure(figsize=self._figsize((11, 6)))
         counts_line = self._format_counts_line()
         plot_title = title or "Gamma Efficiency vs NSB Trigger Rate"
         plt.title("\n".join([p for p in (plot_title, counts_line) if p]))
@@ -4885,7 +4974,7 @@ class StatPlotter:
         y_range: Optional[Tuple[float, float]] = None,
     ):
         self._reset_custom_legend_state()
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(title or "NSB Trigger Rate vs Threshold")
         plt.xlabel("Threshold")
         plt.ylabel("NSB Trigger Rate (Hz)")
@@ -4965,7 +5054,7 @@ class StatPlotter:
         y_range: Optional[Tuple[float, float]] = None,
     ):
         self._reset_custom_legend_state()
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(title or "NSB Trigger Rate vs Threshold (per-curve normalized)")
         plt.xlabel("Threshold / max threshold (per curve)")
         plt.ylabel("NSB Trigger Rate (Hz)")
@@ -5305,7 +5394,7 @@ class StatPlotter:
             score_threshold=score_threshold,
             include_threshold=True,
         )
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Pre-threshold score distribution - Config: {title_config_text}")
         plt.xlabel("Pre-threshold score")
         plt.ylabel("Events / bin")
@@ -5350,7 +5439,7 @@ class StatPlotter:
             n_pe_lo, n_pe_hi = n_pe_range
         energy_edges = np.logspace(np.log10(max(energy_lo, 1e-4)), np.log10(energy_hi + 1e-4), energy_bins)
         n_pe_edges = np.logspace(np.log10(max(n_pe_lo, 1e-3)), np.log10(n_pe_hi + 1e-3), n_pe_bins)
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=self._figsize((10, 6)))
         plt.title(f"Energy vs Npe - Base Config: {self.base_reference_config}")
         plt.xlabel("Energy (TeV)")
         plt.ylabel("Npe")
@@ -5491,7 +5580,7 @@ class StatPlotter:
             expected_slope=expected_slope,
         )
 
-        plt.figure(figsize=(17, 7), constrained_layout=True)
+        plt.figure(figsize=self._figsize((17, 7)), constrained_layout=True)
         counts_line = self._format_counts_line()
         title_parts = [title, "Number of simulated and triggered events", counts_line]
         plt.title("\n".join([p for p in title_parts if p]))
@@ -5554,7 +5643,7 @@ class StatPlotter:
             expected_slope=expected_slope,
         )
 
-        plt.figure(figsize=(17, 7), constrained_layout=True)
+        plt.figure(figsize=self._figsize((17, 7)), constrained_layout=True)
         counts_line = self._format_counts_line()
         title_parts = [title, "Trigger effective collection area", counts_line]
         plt.title("\n".join([p for p in title_parts if p]))
