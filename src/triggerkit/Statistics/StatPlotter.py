@@ -2613,6 +2613,122 @@ class StatPlotter:
                 })
             return folds
 
+    def _fold_signature(self, h5_path: str, fold: str) -> Optional[Dict[str, Any]]:
+        """Fingerprint of one fold's event sample, used to tell whether two
+        stats files ran the SAME events under that fold.
+
+        Holds the fold's /folds/config row (condition, NSB kind, seed, shifts,
+        ...) and, per class, the event count plus a digest of the sorted
+        (event_id, n_pe) multiset -- event_id alone is not unique (several
+        simtel runs reuse ids). Returns None when the file has no such fold,
+        and ``{"no_folds": True}`` for a legacy file without a `fold` column
+        (its rows are read as one sample, so there is nothing to check).
+        Cached per (path, fold).
+        """
+        import hashlib
+
+        cache = self.__dict__.setdefault("_fold_signature_cache", {})
+        key = (h5_path, fold)
+        if key in cache:
+            return cache[key]
+
+        def s(x):
+            return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+        sig: Optional[Dict[str, Any]]
+        with h5py.File(h5_path, "r") as f:
+            grp = f["events"] if "events" in f else None
+            if grp is None or "fold" not in grp:
+                sig = {"no_folds": True}
+            else:
+                names = [s(x) for x in f["folds"]["name"][()]] if "folds" in f else []
+                if fold not in names:
+                    sig = None
+                else:
+                    idx = names.index(fold)
+                    cfg_row: Dict[str, Any] = {}
+                    if "config" in f["folds"]:
+                        for k, ds in f["folds"]["config"].items():
+                            v = ds[idx]
+                            cfg_row[k] = s(v) if isinstance(v, (bytes, bytearray, str)) else np.asarray(v).tolist()
+                    m = np.asarray(grp["fold"][()]).reshape(-1) == idx
+                    labels = np.asarray(grp["label"][()]).reshape(-1)[m]
+                    eid = np.asarray(grp["event_id"][()]).reshape(-1)[m] if "event_id" in grp else None
+                    npe = np.asarray(grp["n_pe"][()], dtype=np.float64).reshape(-1)[m] if "n_pe" in grp else None
+                    sig = {"config": cfg_row}
+                    for kind in ("gamma", "nsb"):
+                        km = self._label_mask(labels, kind)
+                        h = hashlib.sha1()
+                        e = eid[km] if eid is not None else np.zeros(int(km.sum()), dtype=np.int64)
+                        p = np.round(npe[km], 3) if npe is not None else np.zeros(len(e))
+                        order = np.lexsort((p, e))
+                        h.update(np.ascontiguousarray(e[order], dtype=np.int64).tobytes())
+                        h.update(np.ascontiguousarray(p[order], dtype=np.float64).tobytes())
+                        sig[kind] = (int(km.sum()), h.hexdigest())
+        cache[key] = sig
+        return sig
+
+    def check_common_folds(
+        self,
+        items: List[Tuple[ConfigType, Any]],
+    ) -> Tuple[set, List[str]]:
+        """Find the requested folds that are NOT comparable across configs.
+
+        ``items`` are ``(config, fold)`` pairs as in generateReport
+        (``_FOLD_UNSET`` = the constructor's fold, ``None`` = every fold, which
+        is not checked). A fold is comparable when every config's file holds it
+        and every file ran the same sample under it: same /folds/config row,
+        same gamma and NSB counts, same (event_id, n_pe) multisets.
+
+        Lets one simulation carry e.g. low+medium and another only medium: the
+        report keeps "medium" for everyone and drops "low" instead of failing.
+        Returns ``(dropped_folds, messages)``.
+        """
+        by_fold: Dict[str, List[Tuple[str, str]]] = {}
+        for cfg, fold in items:
+            eff = self._default_fold if fold is _FOLD_UNSET else fold
+            if eff is None:
+                continue
+            res = self.get_results(cfg)
+            path = res.get("_path") if res else None
+            if not path:
+                continue
+            entries = by_fold.setdefault(str(eff), [])
+            if path not in [p for p, _ in entries]:
+                entries.append((path, self._cv_label_for_chain(res.get("trigger_chain", []))))
+
+        dropped: set = set()
+        messages: List[str] = []
+        for fold, entries in by_fold.items():
+            sigs = [(label, self._fold_signature(path, fold)) for path, label in entries]
+            missing = [label for label, sg in sigs if sg is None]
+            if missing:
+                dropped.add(fold)
+                messages.append(f"fold '{fold}' dropped: missing in {', '.join(missing)}")
+                continue
+            sigs = [(label, sg) for label, sg in sigs if not sg.get("no_folds")]
+            if len(sigs) < 2:
+                continue
+            ref_label, ref = sigs[0]
+            problems = []
+            for label, sg in sigs[1:]:
+                diff = []
+                if sg["config"] != ref["config"]:
+                    keys = sorted(k for k in set(sg["config"]) | set(ref["config"])
+                                  if sg["config"].get(k) != ref["config"].get(k))
+                    diff.append(f"fold config ({', '.join(keys)})")
+                for kind in ("gamma", "nsb"):
+                    if sg[kind][0] != ref[kind][0]:
+                        diff.append(f"{kind} count {sg[kind][0]} vs {ref[kind][0]}")
+                    elif sg[kind][1] != ref[kind][1]:
+                        diff.append(f"{kind} events/n_pe")
+                if diff:
+                    problems.append(f"{label} vs {ref_label}: {'; '.join(diff)}")
+            if problems:
+                dropped.add(fold)
+                messages.append(f"fold '{fold}' dropped: different samples -- " + " | ".join(problems))
+        return dropped, messages
+
     @staticmethod
     def _auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
         """Hanley & McNeil standard error of an AUC."""
@@ -2910,10 +3026,16 @@ class StatPlotter:
         cross_validation: bool = True,
         cross_validation_n_sigma: float = 3.0,
         cross_validation_condition: Optional[str] = None,
+        common_folds_only: bool = True,
     ) -> str:
         """
         Generate a markdown report plus the main plots commonly used in the
         SST-1M TDScan studies.
+
+        ``common_folds_only``: drop every requested fold that is missing from
+        one config's file or ran a different sample there (see
+        ``check_common_folds``); the dropped folds are printed and listed with
+        the skipped configs in the report.
 
         The report contains:
         - combined plots for the provided configurations
@@ -2991,6 +3113,25 @@ class StatPlotter:
                 slug = self._report_config_slug(cfg, idx)
                 resolved_configs.append(cfg)
                 config_descriptions.append((cfg, label, slug, short_name, fold_override))
+
+            # Keep only the folds every config can be compared on (present in
+            # each file, same events/n_pe) -- e.g. one simulation has low+medium,
+            # another only medium: plot medium only rather than fail.
+            if common_folds_only and config_descriptions:
+                dropped_folds, fold_messages = self.check_common_folds(
+                    [(cfg, fold) for cfg, _l, _s, _n, fold in config_descriptions])
+                for msg in fold_messages:
+                    print(f"[generateReport] {msg}")
+                    skipped_configs.append(msg)
+                if dropped_folds:
+                    def _eff(fold):
+                        return self._default_fold if fold is _FOLD_UNSET else fold
+                    config_descriptions = [d for d in config_descriptions
+                                           if _eff(d[4]) not in dropped_folds]
+                    resolved_configs = [d[0] for d in config_descriptions]
+                    if not resolved_configs:
+                        raise ValueError(
+                            "No fold is common to every configuration: " + "; ".join(fold_messages))
 
             if not resolved_configs:
                 raise ValueError("None of the requested configurations were found in the stat folder.")
