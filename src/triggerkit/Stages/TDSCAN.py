@@ -991,7 +991,7 @@ class TDSCAN(tf.keras.layers.Layer):
             raise NotImplementedError("Quantized call training not implemented yet.")
         if not self._quantization_enabled():
             raise ValueError("call_quantized requires quantization to be enabled.")
-        x = inputs
+        x = tf.convert_to_tensor(inputs)   # accept numpy arrays too
         if x.shape.rank == 3:
             x = x[..., tf.newaxis]  # (B,N,T,1)
         x = tf.cast(x, tf.float32)

@@ -34,3 +34,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 triggerkit = ["**/*.json", "camera/*.cfg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# pytest-filter-subpackage (pulled in by astropy/ctapipe test deps) breaks on pytest 9
+addopts = "-p no:pytest_filter_subpackage"
+# third-party deprecation noise (matplotlib's mathtext via pyparsing) from rendering the report
+filterwarnings = [
+    "ignore::DeprecationWarning:pyparsing.*",
+    "ignore::DeprecationWarning:matplotlib.*",
+]

@@ -46,8 +46,9 @@ class TemporalMovingAverage(tf.keras.layers.Layer):
             raise ValueError("TemporalMovingAverage expects rank 3 or 4 inputs")
 
         dtype = tf.as_dtype(self.compute_dtype or tf.keras.backend.floatx())
-        # Conv1D kernel: [time, in_ch, out_ch]; we keep channel_multiplier=1 (depthwise per channel)
-        kernel = np.ones((self.window_size, channels, 1), dtype=dtype.as_numpy_dtype)
+        # Channels are folded into the batch in call(), so one shared
+        # [time, 1, 1] kernel averages every channel independently.
+        kernel = np.ones((self.window_size, 1, 1), dtype=dtype.as_numpy_dtype)
         kernel /= float(self.window_size)
         self._kernel = tf.constant(kernel, dtype=dtype)
         super().build(input_shape)
@@ -64,7 +65,9 @@ class TemporalMovingAverage(tf.keras.layers.Layer):
 
         # Collapse pixel axis into batch so we convolve only along time.
         b, n, t, c = tf.unstack(tf.shape(x))
-        x_flat = tf.reshape(x, (b * n, t, c))  # (B*N, T, C)
+        # (B,N,T,C) -> (B,N,C,T) -> (B*N*C, T, 1): each channel is smoothed on
+        # its own (a [w, C, 1] kernel would SUM the channels into one).
+        x_flat = tf.reshape(tf.transpose(x, (0, 1, 3, 2)), (b * n * c, t, 1))
 
         y_flat = tf.nn.conv1d(
             x_flat,
@@ -73,7 +76,7 @@ class TemporalMovingAverage(tf.keras.layers.Layer):
             padding="SAME",
         )  # (B*N, T, C)
 
-        y = tf.reshape(y_flat, (b, n, t, c))  # (B, N, T, C)
+        y = tf.transpose(tf.reshape(y_flat, (b, n, c, t)), (0, 1, 3, 2))  # (B, N, T, C)
 
         if rank == 3:
             return tf.squeeze(y, axis=-1)

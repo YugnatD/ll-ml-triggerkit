@@ -19,6 +19,10 @@ def tdscan_to_dbscan_params(eps_xy, eps_t, tolerance=1e-3):
         dbscan_eps = eps_xy * HEXAGON_SIZE_CM * 6
     else:
         raise ValueError(f"Invalid eps_xy value: {eps_xy}")
+    if eps_t < 1 or dbscan_eps <= HORIZ_DISTANCE_CM:
+        raise ValueError(
+            f"No valid DBSCAN time spacing for eps_xy={eps_xy}, eps_t={eps_t}: "
+            "need eps_t >= 1 and eps_xy >= 1 (eps_xy=0 has no spatial slack to convert).")
     z_spacing_cm = np.sqrt(dbscan_eps**2 - (HORIZ_DISTANCE_CM)**2) / eps_t
     dbscan_eps = dbscan_eps / 100.0  # convert to meters
     z_spacing_cm = z_spacing_cm / 100.0  # convert to meters

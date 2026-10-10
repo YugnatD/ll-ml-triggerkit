@@ -25,6 +25,7 @@ class H5StatsWriter:
         tel_pos_x, tel_pos_y, tel_pos_z: float32
         n_clusters: uint8   (optional legacy hard trigger)
         p_trig: float32 (optional, threshold-layer output probability)
+        triggered: uint8 (optional, hard trigger decision 0/1 -- preferred over p_trig)
         pre_threshold_score: float32 (optional, scalar score immediately before TrainableThreshold)
         fold: uint8   (cross-validation fold index; 0 for a plain single run)
       /folds group (one entry per cross-validation fold; `fold` column indexes it)
@@ -144,6 +145,7 @@ class H5StatsWriter:
         # Update counters/minmax.
         label = cols.get("label", None)
         n_clusters = cols.get("n_clusters", None)
+        triggered = cols.get("triggered", None)
         pre_threshold_score = cols.get(PRE_THRESHOLD_SCORE_DATASET, None)
         n_pe = cols.get("n_pe", None)
 
@@ -152,6 +154,8 @@ class H5StatsWriter:
             label = np.asarray(label)
             if n_clusters is not None:
                 n_clusters = np.asarray(n_clusters)
+            if triggered is not None:
+                triggered = np.asarray(triggered)
             if pre_threshold_score is not None:
                 pre_threshold_score = np.asarray(pre_threshold_score, dtype=np.float32)
             if n_pe is not None:
@@ -163,6 +167,11 @@ class H5StatsWriter:
             def _n_trig(mask):
                 # Prefer the legacy hard-trigger cluster count; otherwise threshold
                 # the pre-threshold score against the stored reference.
+                if triggered is not None:
+                    # explicit hard decision written by the caller -- the only
+                    # source that is right for chains with no TrainableThreshold
+                    # (OR chains, FADC-only, ...)
+                    return int((triggered[mask] > 0).sum())
                 if n_clusters is not None:
                     return int((n_clusters[mask] > 0).sum())
                 if pre_threshold_score is not None and PRE_THRESHOLD_REFERENCE_ATTR in self.f.attrs:

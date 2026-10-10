@@ -10,9 +10,11 @@ behaviour unchanged.
 import numpy as np
 import tensorflow as tf
 
+from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
     SimTelTFDataset,
+    iterate_batches,
     SimTelTFDatasetConfig,
 )
 
@@ -96,16 +98,12 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None):
     training/early-stopping split never used so the selection is unbiased.
     """
     config = config or _selection_config()
+    gamma_files = normalize_files(gamma_files, name="gamma_files", require_nonempty=True)
     single = not isinstance(score_outputs, (list, tuple))
     outputs = [score_outputs] if single else list(score_outputs)
 
-    if chain.camera_name == "DigiCam_R0Alpha":
-        pre_inputs = chain.input_layer
-        pack_inputs = lambda wf, ped: wf
-    else:
-        pre_inputs = [chain.input_layer, chain.input_baseline]
-        pack_inputs = lambda wf, ped: (wf, ped)
-    score_model = tf.keras.Model(inputs=pre_inputs, outputs=outputs)
+    score_model = tf.keras.Model(inputs=chain.model_inputs(), outputs=outputs)
+    pack_inputs = chain.pack_model_inputs
 
     ds = SimTelTFDataset(
         gamma_files=gamma_files,
@@ -116,7 +114,7 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None):
 
     g_chunks = [[] for _ in outputs]
     n_chunks = [[] for _ in outputs]
-    for feat, lbl in ds:
+    for feat, lbl in iterate_batches(ds):
         wf = tf.reshape(tf.cast(feat["waveform"], tf.uint16),
                         (-1, chain.num_pixels, chain.num_samples))
         ped = tf.reshape(tf.cast(feat["pedestal"], tf.int32), (-1, chain.num_pixels))

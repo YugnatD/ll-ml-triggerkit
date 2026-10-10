@@ -30,10 +30,10 @@ QUICK_THRESHOLD_EVENTS = 2_000
 # The folds of stats_tdscan.py and stats_patch7.py, kept identical so the two
 # runs compare fold by fold. Row 0 is the untouched reference fold. Keys:
 #   gamma_deg        camera rotation of the gamma events, multiple of 120 (exact symmetry)
-#   gamma_time_shift circular roll of the gamma waveforms, in samples
+#   gamma_time_shift edge-hold time shift of the gamma waveforms, in samples (NOT circular)
 #   nsb_kind         "original" / "rolled" / "shuffle" (NSB pixel reindexing)
 #   nsb_param        roll shift or shuffle seed
-#   nsb_time_shift   circular roll of the NSB waveforms, in samples
+#   nsb_time_shift   edge-hold time shift of the NSB waveforms, in samples
 #   name             explicit fold name
 # patch7 learns nothing, so for it the folds are a consistency check (any drift
 # is a geometry bug); for TDSCAN a drift that patch7 does not show is leakage.

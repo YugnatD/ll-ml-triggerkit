@@ -49,7 +49,15 @@ from triggerkit.Statistics.H5StatsWriter import (
     PRE_THRESHOLD_REFERENCE_ATTR,
     PRE_THRESHOLD_SCORE_DATASET,
 )
-from triggerkit.Statistics.metrics import roc_auc_mann_whitney, roc_curve
+from triggerkit.Statistics.folds import read_folds_group, auc_standard_error, fold_aucs  # noqa: F401
+from triggerkit.Statistics.metrics import (  # noqa: F401  (wilson is re-exported: callers import it from here)
+    normalize_comparison,
+    pick_threshold_from_scores,
+    roc_auc_mann_whitney,
+    roc_curve,
+    trigger_rate_curve,
+    wilson,
+)
 
 try:
     import h5py
@@ -86,26 +94,6 @@ def _as_str(x: Any) -> str:
         except Exception:
             return str(x)
     return str(x)
-
-
-def wilson(passed, total, level=0.68):
-    #implementation as of: https://root.cern.ch/doc/master/TEfficiency_8cxx_source.html#l03837
-    alpha = (1.0 - level) / 2.0
-    if total == 0:
-        return np.nan,np.nan,np.nan
-
-    average = passed / total
-    kappa = norm.ppf(1.0 - alpha)
-
-    mode = (passed + 0.5 * kappa * kappa) / (total + kappa * kappa)
-
-    delta = (kappa / (total + kappa * kappa)) * np.sqrt(
-        total * average * (1.0 - average) + (kappa * kappa) / 4.0
-    )
-
-    low = max(0.0, mode - delta)
-    high = min(1.0, mode + delta)
-    return average, average - low, high - average
 
 
 def compute_efficiency_wilson(xaxis_list, trigger_list,binning):
@@ -233,7 +221,7 @@ def compute_ratio_with_errors(model_base, model):
 class StatPlotter:
     def __init__(
         self,
-        base_reference_config: ConfigType = [("digital_sum", {"threshold_flower": 2229, "mode": "flower"})],
+        base_reference_config: ConfigType = [("digital_sum", {"threshold_flower": 2229, "mode": "patch7"})],
         stat_folder: Union[str, List[str]] = "output_gamma",
         allow_h5: bool = True,
         float_atol: float = 1e-6,
@@ -241,7 +229,10 @@ class StatPlotter:
         h5_chunk_rows: int = 200_000,
         fold: Optional[str] = None,
         style: str = "report",
+        allow_legacy_pickle: bool = False,
     ):
+        # Legacy stats files may hold a pickled chain: refused unless you vouch for them.
+        self.allow_legacy_pickle = bool(allow_legacy_pickle)
         # Accept either a single folder string or a list of folders.
         folders = [stat_folder] if isinstance(stat_folder, str) else list(stat_folder)
         self.stat_folder = folders[0]  # kept for backwards-compat (e.g. report output dir)
@@ -272,6 +263,8 @@ class StatPlotter:
         self.wilson_level = 0.68
 
         self.all_results: List[Tuple[str, Dict[str, Any]]] = []
+        # needed before the first get_results() (base config lookup below)
+        self._warned_messages: set[str] = set()
 
         if allow_h5:
             for folder in folders:
@@ -316,7 +309,10 @@ class StatPlotter:
         self._roc_auc_cache: Dict[str, float] = {}
         self._score_threshold_cache: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
         self._score_rate_cache: Dict[Tuple[str, float, str], float] = {}
-        self._warned_messages: set[str] = set()
+        # (path, fold) -> stored NSB rate; the file is immutable once written
+        self._fold_rate_cache: Dict[Tuple[str, str], Optional[float]] = {}
+        # (path, fold, binning) -> n_pe histogram of the gamma events (sanity check)
+        self._npe_hist_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
         self._queued_plot_colors: Dict[str, str] = {}
         self._active_plot_colors: Dict[str, str] = {}
         self._active_plot_linestyles: Dict[str, str] = {}
@@ -529,13 +525,19 @@ class StatPlotter:
             chain_ll = json.loads(raw)  # list of [stage, params]
             return [(str(stage), dict(params)) for stage, params in chain_ll]
 
-        # Backward-compatible pickle attrs
+        # Very old files stored the chain as a pickle. Unpickling executes code
+        # contained in the file, so it is refused unless the caller vouches for the
+        # files (allow_legacy_pickle=True).
         for k in ("trigger_chain_pickle", "trigger_chain_pkl"):
             if k in attrs:
+                if not self.allow_legacy_pickle:
+                    raise ValueError(
+                        f"stores its trigger chain as a pickle ({k!r}); opening it can execute "
+                        "code. Re-generate the file, or pass allow_legacy_pickle=True if you "
+                        "trust it.")
                 v = attrs[k]
                 b = v.tobytes() if hasattr(v, "tobytes") else bytes(v)
-                chain = pickle.loads(b)
-                # normalize
+                chain = pickle.loads(b)  # noqa: S301 - explicitly opted in
                 return [(str(stage), dict(params)) for stage, params in chain]
 
         return []
@@ -556,19 +558,7 @@ class StatPlotter:
 
     @staticmethod
     def _normalize_threshold_comparison(comparison: Optional[str]) -> str:
-        if comparison is None:
-            return "gt"
-        aliases = {
-            ">": "gt",
-            "gt": "gt",
-            "strict": "gt",
-            "score > tau": "gt",
-            ">=": "ge",
-            "ge": "ge",
-            "inclusive": "ge",
-            "score >= tau": "ge",
-        }
-        return aliases.get(str(comparison).strip().lower(), "gt")
+        return normalize_comparison(comparison)
 
     def _extract_threshold_comparison_from_chain(self, chain: ConfigType) -> str:
         comparison = "gt"
@@ -668,6 +658,7 @@ class StatPlotter:
 
     def get_results(self, to_find_config: ConfigType) -> Optional[Dict[str, Any]]:
         result_config = None
+        matching_files: List[str] = []
         for filename, result in self.all_results:
             trigger_chain = result.get("trigger_chain") or result.get("trigger_chain", [])
             if trigger_chain is None:
@@ -677,13 +668,21 @@ class StatPlotter:
             chain_norm: ConfigType = [(str(s), dict(p)) for s, p in trigger_chain]
 
             if self._match_chain(chain_norm, to_find_config):
-                result_config = dict(result)  # shallow copy
-                result_config["trigger_chain"] = chain_norm
-                result_config["_filename"] = filename
-                break
+                matching_files.append(filename)
+                if result_config is None:     # first match wins ...
+                    result_config = dict(result)  # shallow copy
+                    result_config["trigger_chain"] = chain_norm
+                    result_config["_filename"] = filename
 
         if result_config is None:
             return None
+        if len(matching_files) > 1:
+            # ... but never silently: the other files are shadowed.
+            self._warn_once(
+                "multi-match:" + "|".join(matching_files),
+                f"Config matches {len(matching_files)} stats files; using "
+                f"'{matching_files[0]}' and ignoring {matching_files[1:]}. "
+                "Pin more parameters in the config (e.g. 'id') to disambiguate.")
 
         return result_config
 
@@ -943,47 +942,32 @@ class StatPlotter:
         desired_fraction: float,
         comparison: Optional[str] = "gt",
     ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-        if scores.size == 0:
-            return None, None, None
+        return pick_threshold_from_scores(scores, desired_fraction, comparison)
 
-        desired_fraction = float(np.clip(desired_fraction, 0.0, 1.0))
-        comparison = cls._normalize_threshold_comparison(comparison)
-        unique_scores, counts = np.unique(scores, return_counts=True)
-        counts = counts.astype(np.int64)
-        total = int(scores.size)
+    def _fold_stored_rate_hz(self, result: Dict[str, Any]) -> Optional[float]:
+        """Stored NSB rate of the currently selected fold (from /folds), or None.
 
-        cumulative = np.cumsum(counts, dtype=np.int64)
-        counts_gt = total - cumulative
-        counts_ge = counts_gt + counts
-
-        if comparison == "ge":
-            tau_strict = np.nextafter(unique_scores.astype(np.float32), np.float32(np.inf))
-            tau_include_ties = unique_scores.astype(np.float32)
-        else:
-            tau_strict = unique_scores.astype(np.float32)
-            tau_include_ties = np.nextafter(unique_scores.astype(np.float32), np.float32(-np.inf))
-
-        candidate_taus = np.concatenate([tau_strict, tau_include_ties])
-        candidate_fractions = np.concatenate([
-            counts_gt.astype(np.float64) / total,
-            counts_ge.astype(np.float64) / total,
-        ])
-        candidate_modes = np.concatenate([
-            np.zeros_like(counts_gt, dtype=np.uint8),
-            np.ones_like(counts_ge, dtype=np.uint8),
-        ])
-
-        errors = np.abs(candidate_fractions - desired_fraction)
-        best_error = float(np.min(errors))
-        best_indices = np.flatnonzero(np.isclose(errors, best_error, rtol=0.0, atol=1e-12))
-        best_include_ties = best_indices[candidate_modes[best_indices] == 1]
-        best_idx = int(best_include_ties[0] if best_include_ties.size > 0 else best_indices[0])
-
-        mode = "score >= bin" if candidate_modes[best_idx] == 1 else "score > bin"
-        return float(candidate_taus[best_idx]), float(candidate_fractions[best_idx]), mode
+        The top-level ``trigger_rate_hz`` attribute describes fold 0 only, so it
+        must not be reported for any other selected fold.
+        """
+        if self._fold_filter is None or not self._is_h5(result) or h5py is None:
+            return None
+        key = (result["_path"], str(self._fold_filter))
+        if key in self._fold_rate_cache:
+            return self._fold_rate_cache[key]
+        rate = None
+        with h5py.File(result["_path"], "r") as f:
+            if "folds" in f and "trigger_rate_hz" in f["folds"]:
+                names = [x.decode() if isinstance(x, bytes) else str(x) for x in f["folds"]["name"][()]]
+                if self._fold_filter in names:
+                    rate = float(f["folds"]["trigger_rate_hz"][()][names.index(self._fold_filter)])
+        self._fold_rate_cache[key] = rate
+        return rate
 
     def _get_result_trigger_rate_hz(self, result: Dict[str, Any]) -> float:
+        fold_rate = self._fold_stored_rate_hz(result)
+        if fold_rate is not None:
+            return fold_rate
         if result.get("trigger_rate") is not None:
             rate = result["trigger_rate"]
             if isinstance(rate, tuple):
@@ -1194,6 +1178,9 @@ class StatPlotter:
             if score_ds is not None and resolved_score_threshold is None:
                 resolved_score_threshold = result.get("reference_threshold")
             trig_ds = None if resolved_score_threshold is not None and score_ds is not None else self._resolve_triggered_ds(grp)
+            # p_trig is a probability: the trigger is p > 0.5 (as in
+            # TriggerChain.compute_statistics), not p > 0.
+            trig_is_prob = trig_ds is not None and trig_ds.name.rsplit("/", 1)[-1] == "p_trig"
 
             n = int(x_ds.shape[0])
             for start in range(0, n, chunk_rows):
@@ -1236,6 +1223,8 @@ class StatPlotter:
                     )
                 elif trig_raw.dtype == np.bool_:
                     trig = trig_raw
+                elif trig_is_prob:
+                    trig = trig_raw > 0.5
                 else:
                     trig = trig_raw > 0
 
@@ -2541,13 +2530,18 @@ class StatPlotter:
             self.init_plot()
             for cfg, label, fold in plot_items:
                 self.add_plot(cfg, label=label, fold=fold)
-            self.showPlot(
+            drawn = self.showPlot(
                 filename=filename,
                 show=show,
                 location=location,
                 plot_type=plot_type,
                 **plot_kwargs,
             )
+            if drawn is False:
+                # the configs are not comparable (sanity check): nothing was
+                # drawn, so do not save/report a blank figure
+                plt.close("all")
+                return False
             self._report_style_current_figure(title=title)
             self._report_stash_vector_figure(filename)
             self._apply_title_policy()
@@ -2571,47 +2565,10 @@ class StatPlotter:
         return f"{core} (thr={thr:.3g})" if thr is not None else core
 
     def _read_folds_group(self, h5_path: str) -> Optional[List[Dict[str, Any]]]:
-        """Read the `/folds` summary table of one stats file.
-
-        Returns a list of per-fold dicts (name, counts, rate, window_sec) with
-        gamma efficiency + NSB rate Wilson errors already attached, or None when
-        the file has no `/folds` group (a plain single-fold / pre-fold file).
-
-        Each fold also carries a threshold-free ``auc`` (+ ``auc_err``) computed
-        from the stored per-event pre-threshold scores, which is what the CV plot
-        prefers: gamma efficiency at a frozen tau conflates separation power with
-        the working point, so a fold that shifts the NSB score distribution drops
-        the efficiency even when the classes are separated exactly as well. The
-        AUC is NaN for files written without per-event scores.
-        """
+        """The ``/folds`` summary table of one stats file (see ``Statistics.folds``)."""
         if h5py is None:
             raise RuntimeError("h5py is not installed but a fold read was requested.")
-
-        def s(x):
-            return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
-
-        with h5py.File(h5_path, "r") as f:
-            if "folds" not in f:
-                return None
-            g = f["folds"]
-            window_sec = self._read_window_sec(f.attrs)
-            names = [s(x) for x in g["name"][()]]
-            gt = g["gamma_trig"][()]; gtot = g["gamma_total"][()]
-            nt = g["nsb_trig"][()];   ntot = g["nsb_total"][()]
-            rate = g["trigger_rate_hz"][()]
-            aucs = self._fold_aucs(f, len(names))
-            folds = []
-            for i, name in enumerate(names):
-                eff, elo, ehi = wilson(int(gt[i]), int(gtot[i]), self.wilson_level)
-                _, rlo, rhi = wilson(int(nt[i]), int(ntot[i]), self.wilson_level)
-                folds.append({
-                    "fold": name,
-                    "eff": eff, "eff_err": max(elo, ehi),
-                    "auc": aucs[i][0], "auc_err": aucs[i][1],
-                    "rate_hz": float(rate[i]),
-                    "rate_err": max(rlo, rhi) / window_sec,
-                })
-            return folds
+        return read_folds_group(h5_path, wilson_level=self.wilson_level)
 
     def _fold_signature(self, h5_path: str, fold: str) -> Optional[Dict[str, Any]]:
         """Fingerprint of one fold's event sample, used to tell whether two
@@ -2732,36 +2689,11 @@ class StatPlotter:
     @staticmethod
     def _auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
         """Hanley & McNeil standard error of an AUC."""
-        if not np.isfinite(auc) or n_pos < 1 or n_neg < 1:
-            return float("nan")
-        q1 = auc / (2.0 - auc)
-        q2 = 2.0 * auc * auc / (1.0 + auc)
-        var = (auc * (1.0 - auc)
-               + (n_pos - 1) * (q1 - auc * auc)
-               + (n_neg - 1) * (q2 - auc * auc)) / (n_pos * n_neg)
-        return float(np.sqrt(max(var, 0.0)))
+        return auc_standard_error(auc, n_pos, n_neg)
 
     def _fold_aucs(self, f: "h5py.File", n_folds: int) -> List[Tuple[float, float]]:
-        """Per-fold (auc, standard_error) from the per-event pre-threshold scores.
-
-        All-NaN when the file stores no per-event score, which makes the CV plot
-        fall back to gamma efficiency.
-        """
-        nan_pair = (float("nan"), float("nan"))
-        out = [nan_pair] * n_folds
-        grp = f.get("events")
-        if grp is None or "pre_threshold_score" not in grp or "fold" not in grp:
-            return out
-        fold = np.asarray(grp["fold"][()]).reshape(-1)
-        label = np.asarray(grp["label"][()]).reshape(-1)
-        score = np.asarray(grp["pre_threshold_score"][()]).reshape(-1)
-        for i in range(n_folds):
-            m = fold == i
-            pos = score[m & (label == 1)]
-            neg = score[m & (label == 0)]
-            auc = roc_auc_mann_whitney(pos, neg)
-            out[i] = (auc, self._auc_standard_error(auc, pos.size, neg.size))
-        return out
+        """Per-fold (auc, standard_error) from the per-event pre-threshold scores."""
+        return fold_aucs(f, n_folds)
 
     def _filter_cv_folds(
         self,
@@ -3047,7 +2979,8 @@ class StatPlotter:
         report PNG/PDF keep the standard style. No effect when a config has no
         score_quantizer stage.
 
-        Returns the absolute path to the generated markdown report.
+        Returns the path of the report: the PDF when ``generate_pdf`` succeeded,
+        otherwise the markdown file (always written, next to the plots).
         """
         output_dir = os.path.abspath(output_dir)
         os.makedirs(output_dir, exist_ok=True)
@@ -3173,6 +3106,9 @@ class StatPlotter:
                         **kwargs,
                     ):
                         combined_sections.append((section_title, filename))
+                    else:
+                        skipped_configs.append(
+                            f"{section_title}: not drawn (configs failed the sanity check or had no data)")
                     return
 
                 # One full page per condition -- each keeps its own vector
@@ -3208,6 +3144,9 @@ class StatPlotter:
                         **panel_kwargs,
                     ):
                         combined_sections.append((panel_title, panel_filename))
+                    else:
+                        skipped_configs.append(
+                            f"{panel_title}: not drawn (configs failed the sanity check or had no data)")
 
                 # PLUS one additional page with every condition overlaid on
                 # the same axes -- color-shaded per condition (same hue per
@@ -3539,6 +3478,7 @@ class StatPlotter:
                         pass
             self._report_vector_figs = None
             self._report_save_svg = False
+            self._apply_fold_override()   # back to the constructor's fold
 
     def generate_report(self, *args, **kwargs):
         return self.generateReport(*args, **kwargs)
@@ -4504,8 +4444,14 @@ class StatPlotter:
         bins = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi + 1e-3), n_pe_bins)
 
         def _hist_and_count(res: Dict[str, Any]) -> Tuple[int, np.ndarray]:
-            all_h, _ = self._histogram_stream(res, "n_pe", kind="gamma", bins=bins)
-            return int(all_h.sum()), all_h.astype(np.float64)
+            # Every plot of a report re-runs this check: the stats files are
+            # immutable, so a full scan per (file, fold, binning) is enough.
+            key = (res["_path"], str(self._fold_filter), float(bins[0]), float(bins[-1]), len(bins))
+            if key not in self._npe_hist_cache:
+                all_h, _ = self._histogram_stream(res, "n_pe", kind="gamma", bins=bins)
+                self._npe_hist_cache[key] = all_h.astype(np.float64)
+            hist = self._npe_hist_cache[key]
+            return int(hist.sum()), hist
 
         ok = True
         n_ref, hist_ref = _hist_and_count(ref_result)
@@ -4559,13 +4505,18 @@ class StatPlotter:
             plotter.showPlot(plot_type="effective_area_counts", filename="aeff_counts.png", emin_tev=0.01, emax_tev=50, nbins=25)
         """
         with self._paper_style_context():
-            return self._show_plot_impl(filename, show, location, plot_type, **plot_kwargs)
+            try:
+                return self._show_plot_impl(filename, show, location, plot_type, **plot_kwargs)
+            finally:
+                # queued items may have switched the active fold; never leave it
+                # switched for whatever the caller does next
+                self._apply_fold_override()
 
     def _show_plot_impl(self, filename, show, location, plot_type, **plot_kwargs):
         # apply the sanity check before plotting
         if not self.sanity_check_configs([item["config"] for item in getattr(self, "_queued_plots", [])]):
             print("Sanity check failed: configurations have different number of events or n_pe distributions.")
-            return
+            return False
         else:
             print("Sanity check passed: all configurations have consistent number of events and n_pe distributions.")
         if plot_type is not None:
@@ -4621,7 +4572,8 @@ class StatPlotter:
             fig.savefig(filename, bbox_inches="tight", dpi=300)
         if show:
             plt.show()
-            
+        return True
+
     def plotNpeDistribution(
         self,
         range: Tuple[float, float] = (0, 2000),
@@ -4791,36 +4743,7 @@ class StatPlotter:
         window_sec: float,
         comparison: Optional[str] = "gt",
     ) -> Tuple[np.ndarray, np.ndarray]:
-        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-        if scores.size == 0:
-            return np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.float64)
-
-        comparison = cls._normalize_threshold_comparison(comparison)
-        unique_scores, counts = np.unique(scores, return_counts=True)
-        counts = counts.astype(np.int64)
-        total = int(scores.size)
-
-        cumulative = np.cumsum(counts, dtype=np.int64)
-        counts_gt = total - cumulative
-        counts_ge = counts_gt + counts
-
-        if comparison == "ge":
-            tau_strict = np.nextafter(unique_scores.astype(np.float32), np.float32(np.inf))
-            tau_include_ties = unique_scores.astype(np.float32)
-        else:
-            tau_strict = unique_scores.astype(np.float32)
-            tau_include_ties = np.nextafter(unique_scores.astype(np.float32), np.float32(-np.inf))
-
-        thresholds = np.concatenate([tau_include_ties, tau_strict])
-        rates_hz = np.concatenate([
-            counts_ge.astype(np.float64) / total / float(window_sec),
-            counts_gt.astype(np.float64) / total / float(window_sec),
-        ])
-
-        order = np.argsort(thresholds, kind="mergesort")
-        thresholds = thresholds[order]
-        rates_hz = rates_hz[order]
-        return thresholds, rates_hz
+        return trigger_rate_curve(scores, window_sec, comparison)
 
     def _get_efficiency_vs_rate_metric_bins(
         self,
@@ -4882,7 +4805,9 @@ class StatPlotter:
         efficiency = np.full(thresholds.shape, np.nan, dtype=np.float64)
         if total > 0:
             gamma_scores = np.sort(gamma_scores.astype(np.float32, copy=False))
-            passed = total - np.searchsorted(gamma_scores, thresholds, side="right")
+            # score > tau  -> count strictly above ("right"); score >= tau -> "left"
+            side = "left" if result.get("threshold_comparison", "gt") == "ge" else "right"
+            passed = total - np.searchsorted(gamma_scores, thresholds, side=side)
             efficiency = passed.astype(np.float64) / float(total)
 
         curves: List[Dict[str, Any]] = [{
@@ -5663,14 +5588,30 @@ class StatPlotter:
         expected_N: int = EA_DEFAULT_TOTAL_THROWN,
         expected_slope: float = EA_DEFAULT_SLOPE,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        self._ea_bins = np.logspace(np.log10(emin_tev), np.log10(emax_tev), nbins)
+        # nbins bins -> nbins+1 edges; points are drawn at the geometric bin centre
+        self._ea_bins = np.logspace(np.log10(emin_tev), np.log10(emax_tev), nbins + 1)
         self._ea_A_gen_m2 = float(A_gen_m2)
         self._ea_use_base_thrown = bool(use_base_thrown)
         self._ea_use_theoretical_thrown = bool(use_theoretical_thrown)
         self._ea_plot_errors = bool(plot_errors)
 
         bins = self._ea_bins
-        x_values = bins[:-1]
+        x_values = np.sqrt(bins[:-1] * bins[1:])
+
+        if use_theoretical_thrown:
+            # Aeff = A_gen * N_trig / N_thrown(theory): N_trig comes from the
+            # events in the stats file, N_thrown from `expected_N`. If the file
+            # is a sub-sample (max_gamma_events, fold budgets, one telescope...)
+            # the two no longer describe the same events and Aeff is off by a
+            # constant factor -- say so instead of plotting it silently.
+            n_file = self.base_config_result.get("num_events_gamma", 0)
+            if n_file and abs(n_file - int(expected_N)) > 0.05 * int(expected_N):
+                self._warn_once(
+                    "ea-expected-n",
+                    f"Effective area: normalising with expected_N={int(expected_N)} thrown "
+                    f"events, but the base stats file holds {n_file} gamma events. If the "
+                    "file is a sub-sample of the simulation, Aeff is scaled wrongly -- pass "
+                    "the real generated count (effective_area_expected_N / expected_N).")
 
         expected_thrown = self._powerlaw_expected_counts(
             bins,
@@ -5873,7 +5814,7 @@ class StatPlotter:
             target_rate_hz=compare_target_rate_hz,
             score_threshold=compare_score_threshold,
         )
-        x_values = self._ea_bins[:-1]
+        x_values = np.sqrt(self._ea_bins[:-1] * self._ea_bins[1:])
 
         strategy = self._resolve_trigger_strategy(
             to_compare_result,
@@ -5944,7 +5885,7 @@ class StatPlotter:
             target_rate_hz=compare_target_rate_hz,
             score_threshold=compare_score_threshold,
         )
-        x_values = bins[:-1]
+        x_values = np.sqrt(bins[:-1] * bins[1:])
 
         strategy = self._resolve_trigger_strategy(
             to_compare_result,

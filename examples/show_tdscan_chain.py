@@ -3,9 +3,10 @@
 Builds the exact deployed (filters=1) TDSCAN chain of ``stats_tdscan.py`` (same
 eps_xy/eps_t, pinned ring weights, frozen tau), then draws the labelled
 stage-by-stage figure for a single ~300 npe gamma -- WITH the temporal
-augmentation of the CV fold ``{"gamma_time_shift": 2}`` applied: the raw
-waveform is circularly rolled +2 samples on the time axis before the chain, so
-every displayed stage sees the shifted pulse (see TriggerChain.show_trigger_chain
+augmentation of a CV fold (``{"gamma_time_shift": N}``) applied: the raw
+waveform is edge-hold shifted by ``TIME_ROLL`` samples on the time axis before
+the chain (the vacated samples repeat the boundary sample, NOT a circular wrap),
+so every displayed stage sees the shifted pulse (see TriggerChain.show_trigger_chain
 ``time_roll`` and augment.make_rotation_folds ``gamma_time_shift``).
 
 Run it (needs a display -- it opens an interactive Qt window):
@@ -36,8 +37,8 @@ RING_WEIGHTS = np.array(
 TAU = 97.9535903930664  # frozen tau from the 12-fold run (50 kHz NSB)
 
 # --- What to show -------------------------------------------------------------
-RANGE_NPE = (250, 350)   # pick a ~300 npe gamma
-TIME_ROLL = 5            # the ((0, 2), "original") fold augmentation: +2 samples
+RANGE_NPE = (250, 350)   # npe window of the gamma to show (~300 npe)
+TIME_ROLL = 5            # edge-hold time shift in samples (= the {"gamma_time_shift": 5} fold)
 SKIP_FIRST_N_EVENTS = 1  # bump to step past earlier matches
 
 

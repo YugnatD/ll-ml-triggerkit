@@ -1,5 +1,8 @@
 import tensorflow as tf
+from keras.saving import register_keras_serializable
 
+
+@register_keras_serializable(package="Trigger")
 class TrainSoftMaxPool2D(tf.keras.layers.Layer):
     def __init__(self, beta=5.0, reduce_channels=False, **kwargs):
         super().__init__(**kwargs)

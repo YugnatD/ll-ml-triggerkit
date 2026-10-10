@@ -34,8 +34,14 @@ class ScatterToGrid(keras.layers.Layer):
     * :meth:`from_geometry` or ``ScatterToGrid(matrix, H, W)`` -- *bound* up front.
     """
 
-    def __init__(self, scatter_matrix=None, H=None, W=None, *, time_skip=0, time_window=None, **kwargs):
+    def __init__(self, scatter_matrix=None, H=None, W=None, *, time_skip=0, time_window=None,
+                 cell_index=None, **kwargs):
         super().__init__(**kwargs)
+        if scatter_matrix is None and cell_index is not None:
+            # compact form written by get_config: one grid cell per pixel
+            cell_index = np.asarray(cell_index, dtype=np.int64)
+            scatter_matrix = np.zeros((cell_index.size, int(H) * int(W)), dtype=np.float32)
+            scatter_matrix[np.arange(cell_index.size), cell_index] = 1.0
         self.time_skip = int(time_skip)
         self.time_window = None if time_window is None else int(time_window)
         if scatter_matrix is None:
@@ -101,7 +107,10 @@ class ScatterToGrid(keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update({
-            "scatter_matrix": None if self.scatter_matrix is None else self.scatter_matrix.tolist(),
+            # one-hot rows -> a (P,) cell index is enough (the full matrix is
+            # P x H*W floats and bloated every saved model). Old configs that
+            # carry "scatter_matrix" still load.
+            "cell_index": None if self.scatter_matrix is None else self.scatter_matrix.argmax(axis=1).tolist(),
             "H": self.H, "W": self.W,
             "time_skip": self.time_skip, "time_window": self.time_window,
         })

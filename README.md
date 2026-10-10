@@ -28,3 +28,10 @@ from triggerkit.TriggerChain import TriggerChain
 Bootstrapping: package extracted from the `python-reference` research sandbox and
 renamed to `triggerkit`. Incremental refactor in progress (dataset, pluggable
 model bodies, cascade statistics).
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest            # ~130 tests, CPU only, a minute or two (some spawn reader processes)
+```

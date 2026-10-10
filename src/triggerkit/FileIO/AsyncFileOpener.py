@@ -30,8 +30,13 @@ repeatedly over a run, so that cost is paid over and over).
 
 from __future__ import annotations
 
+import contextlib
 import enum
+import os
 import queue
+import sys
+import threading
+import traceback
 import warnings
 import multiprocessing as mp
 
@@ -45,6 +50,49 @@ from triggerkit.FileIO.FileOpenerCTAOSimtel import FileOpenerCTAOSimtel
 _SPAWN_CTX = mp.get_context("spawn")
 
 
+_MAIN_HIDE_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _without_main_module():
+    """Hide ``__main__.__file__`` / ``__spec__`` while a worker is being spawned.
+
+    ``spawn`` makes the child re-import the parent's main script (that is how it
+    finds ``__main__``). Every example imports TensorFlow at module level, so
+    each reader process used to pay a full TensorFlow import (measured: ~12 s
+    instead of ~2-3 s per opened file) just to run ``_producer``, which needs
+    nothing from the main script: it is pickled by reference to THIS module.
+    Without a file/spec to re-import, the child skips that step.
+    """
+    main = sys.modules.get("__main__")
+    with _MAIN_HIDE_LOCK:
+        saved = {}
+        if main is not None:
+            for attr in ("__spec__", "__file__"):
+                if hasattr(main, attr):
+                    saved[attr] = getattr(main, attr)
+                    setattr(main, attr, None)
+        try:
+            yield
+        finally:
+            for attr, value in saved.items():
+                setattr(main, attr, value)
+
+
+#: First element of the 2-tuple a producer puts on the queue when it crashed
+#: (real items are 10-tuples, so the two can never be confused).
+_ERROR_TAG = "__producer_error__"
+
+
+class FileReadError(RuntimeError):
+    """A file could not be (fully) read by its worker process.
+
+    Raised by :class:`AsyncFileOpenerProcess` so callers that stream many files
+    can skip just that file (see ``SimTelTFDataset``) instead of treating it as
+    a clean end of data.
+    """
+
+
 class FileType(enum.Enum):
     SIMTEL = 1  # .simtel.gz files
     H5 = 2  # .h5 files
@@ -52,6 +100,7 @@ class FileType(enum.Enum):
 
 class FileOpenerCTAO:
     def __init__(self, filepath):
+        filepath = os.fspath(filepath)            # accepts pathlib.Path too
         self.filepath = filepath
         self.file_type = self._detect_file_type(filepath)
         if self.file_type == FileType.SIMTEL:
@@ -59,7 +108,8 @@ class FileOpenerCTAO:
         elif self.file_type == FileType.H5:
             self._impl = FileOpenerCTAOHDF5(filepath)
         else:
-            raise ValueError("Unsupported file format.")
+            raise ValueError(
+                f"Unsupported file format: {filepath!r} (expected .simtel, .simtel.gz, .h5 or .hdf5).")
 
     @staticmethod
     def _detect_file_type(filepath: str) -> FileType:
@@ -70,6 +120,11 @@ class FileOpenerCTAO:
         return None
 
     def __getattr__(self, name):
+        # Only called when normal lookup fails. Never forward "_impl" itself:
+        # if it is not set yet (copy/pickle/failed __init__), looking it up here
+        # would recurse forever.
+        if name == "_impl" or (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(name)
         return getattr(self._impl, name)
 
     def __enter__(self):
@@ -109,7 +164,7 @@ class AsyncFileOpenerProcess:
         SimTelTFDataset (which knows it wants exactly one waveform_level and
         never touches dl0/dl1/true_image) opts into trimming.
         """
-        # print(f"Starting AsyncFileOpenerProcess for {filepath}")
+        filepath = os.fspath(filepath)
         self.filepath = filepath
         self._queue = _SPAWN_CTX.Queue(maxsize=max_queue_size)
         self._sentinel = None  # value used to signal end of stream
@@ -120,7 +175,8 @@ class AsyncFileOpenerProcess:
             name="CTAO Async File Opener Process",
             daemon=True,
         )
-        self._proc.start()
+        with _without_main_module():
+            self._proc.start()
         self._finished = False
 
     @staticmethod
@@ -153,6 +209,10 @@ class AsyncFileOpenerProcess:
                 q.put((tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
                        true_image_list, peak_time_list, pedestal_per_sample_list,
                        event_stat_list, i_event))
+        except BaseException:
+            # Do NOT let the consumer mistake a crash (corrupt file, unreadable
+            # path, ...) for a normal end of stream: ship the traceback over.
+            q.put((_ERROR_TAG, traceback.format_exc()))
         finally:
             # signal completion
             q.put(None)
@@ -191,6 +251,14 @@ class AsyncFileOpenerProcess:
                     )
                     raise StopIteration
                 # still alive, just slow (large/slow file) -- keep waiting.
+
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == _ERROR_TAG:
+            self._finished = True
+            msg = (f"AsyncFileOpenerProcess: reading {self.filepath!r} failed in the "
+                   f"worker process; the data from this file is incomplete.\n{item[1]}")
+            # warn too: tf.data's ignore_errors would otherwise swallow the raise
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            raise FileReadError(msg)
 
         if item is self._sentinel:
             # make sure background process has terminated

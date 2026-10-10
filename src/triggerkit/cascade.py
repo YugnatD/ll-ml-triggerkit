@@ -23,6 +23,7 @@ import tensorflow as tf
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
     SimTelTFDataset,
+    iterate_batches,
     SimTelTFDatasetConfig,
 )
 
@@ -138,7 +139,7 @@ class TriggerCascade:
         n_total = 0
         n_pass = [0] * len(self.stages)
         s0 = self.stages[0]
-        for feat, lbl in ds:
+        for feat, lbl in iterate_batches(ds):
             l = tf.reshape(tf.cast(lbl, tf.int32), (-1,)).numpy()
             keep = l == label
             if not np.any(keep):
@@ -146,6 +147,12 @@ class TriggerCascade:
             wf, ped = self._tensors(s0, feat)
             wf = tf.boolean_mask(wf, keep)
             ped = tf.boolean_mask(ped, keep)
+            if max_events is not None:
+                # exact cap: keep only the events that still fit in the budget
+                room = max_events - n_total
+                if room <= 0:
+                    break
+                wf, ped = wf[:room], ped[:room]
             n_total += int(wf.shape[0])
 
             surviving = tf.ones((wf.shape[0],), dtype=tf.bool).numpy()
@@ -227,7 +234,7 @@ class TriggerCascade:
         n_total = 0
         n_up = 0
         s0 = self.stages[0]
-        for feat, lbl in ds:
+        for feat, lbl in iterate_batches(ds):
             l = tf.reshape(tf.cast(lbl, tf.int32), (-1,)).numpy()
             keep = l == 0
             if not np.any(keep):
@@ -235,6 +242,11 @@ class TriggerCascade:
             wf, ped = self._tensors(s0, feat)
             wf = tf.boolean_mask(wf, keep)
             ped = tf.boolean_mask(ped, keep)
+            if max_events is not None:
+                room = max_events - n_total
+                if room <= 0:
+                    break
+                wf, ped = wf[:room], ped[:room]
             n_total += int(wf.shape[0])
 
             surviving = np.ones((wf.shape[0],), dtype=bool)

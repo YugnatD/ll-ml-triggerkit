@@ -35,7 +35,9 @@ from triggerkit.Stages.ScoreQuantizer import ScoreQuantizer
 from triggerkit.Stages.TrainableThreshold import TrainableThreshold
 from triggerkit.Stages.OrMerge import OrMerge
 from triggerkit.Stages.FADC import FADC, FADCList
-from triggerkit.FileIO.FileOpenerCTAO import FileOpenerCTAO, AsyncFileOpenerProcess, SimTelTFDataset, SimTelTFDatasetConfig
+from triggerkit.FileIO.paths import normalize_files
+from triggerkit.Helper.history import load_history, load_legacy_npy_history, save_history
+from triggerkit.FileIO.FileOpenerCTAO import FileOpenerCTAO, AsyncFileOpenerProcess, SimTelTFDataset, SimTelTFDatasetConfig, iterate_batches
 
 from triggerkit.Loss.RateConstrainedBCE import RateConstrainedBCE
 
@@ -54,7 +56,7 @@ from triggerkit.Statistics.H5StatsWriter import (
     PRE_THRESHOLD_REFERENCE_ATTR,
     PRE_THRESHOLD_SCORE_DATASET,
 )
-from triggerkit.Statistics.metrics import roc_auc_mann_whitney
+from triggerkit.Statistics.metrics import roc_auc_mann_whitney, pick_threshold_from_scores
 
 from triggerkit.Helper.Quantize import FixedPointConstraint
 
@@ -114,11 +116,16 @@ def _verify_model_reloads(model_path, ckpt_path=None):
 
 
 class TriggerChain:
-  def __init__(self, simtel_path: str, simtel_nsb_path: str = None):
-    self.simtel_path = simtel_path
-    self.simtel_nsb_path = simtel_nsb_path
-    # check if simtel_path is a list or a string
-    first_path = simtel_path[0] if isinstance(simtel_path, list) else simtel_path
+  def __init__(self, simtel_path, simtel_nsb_path=None):
+    """``simtel_path`` / ``simtel_nsb_path``: a path or a list/tuple of paths (``str`` or
+    ``pathlib.Path``). Both are stored as lists of ``str``; the NSB list may be empty."""
+    self.simtel_path = normalize_files(simtel_path, name="simtel_path")
+    self.simtel_nsb_path = normalize_files(simtel_nsb_path, name="simtel_nsb_path")
+    # the geometry is read from the first gamma file (else the first NSB file)
+    probe_files = self.simtel_path or self.simtel_nsb_path
+    if not probe_files:
+        raise ValueError("TriggerChain needs at least one gamma (simtel_path) or NSB (simtel_nsb_path) file.")
+    first_path = probe_files[0]
 
     # Use as a context manager so the geometry-probe file (and its underlying
     # ctapipe/h5py handle) is always released, even though we only read the
@@ -139,10 +146,7 @@ class TriggerChain:
         for tel_ids_list, wf_list, wf1_list, dl0_list, dl1_list, true_image_list, _peak_time_list, pedestal_per_sample_list, event_stat_list, _ in src:
             if len(wf_list) > 0:
                 # print(wf_list[0].shape)
-                try:
-                    self.num_samples = wf_list[0].shape[1]
-                except Exception as e:
-                    self.num_samples = 432
+                self.num_samples = wf_list[0].shape[1]
                 break
     if not hasattr(self, 'num_samples'):
         raise ValueError("Could not determine number of samples from the simtel file.")
@@ -161,6 +165,23 @@ class TriggerChain:
     # skips fadc gets a single-input model instead of a Keras "inputs not
     # connected to outputs" error.
     self._baseline_connected = False
+
+  def model_inputs(self):
+    """Keras inputs of a model built on this chain, as ``Model(inputs=...)`` wants them.
+
+    One input (the waveform) unless a ``fadc`` stage actually wired the baseline
+    in -- exactly what ``compile_chain`` does. Anything that builds an auxiliary
+    model (calibration, filter selection, training score models) must use this
+    rather than guess from the camera name: Keras rejects an input that is not
+    connected to the outputs.
+    """
+    if self._baseline_connected:
+        return [self.input_layer, self.input_baseline]
+    return self.input_layer
+
+  def pack_model_inputs(self, wf, ped):
+    """Arrange a (waveform, pedestal) batch like :meth:`model_inputs` expects."""
+    return (wf, ped) if self._baseline_connected else wf
 
   def add_stage(self, stage_name, **kwargs):
     if stage_name == "digital_sum":
@@ -302,7 +323,8 @@ class TriggerChain:
   def compile_chain(self,
                     loss=None,
                     optimizer=None,
-                    model_path:str=None
+                    model_path:str=None,
+                    trust_legacy_history:bool=False
                     ):
     self.model_path = model_path
     if self.model_path is not None and os.path.exists(self.model_path):
@@ -317,6 +339,7 @@ class TriggerChain:
             'FADC': FADC,
             'DigitalSum': DigitalSum,
             'TemporalMovingAverage': TemporalMovingAverage,
+            'TrainSoftMaxPool2D': TrainSoftMaxPool2D,
             'Shift': Shift,
             'ScoreQuantizer': ScoreQuantizer,
             'OrMerge': OrMerge,
@@ -327,11 +350,19 @@ class TriggerChain:
             'FixedPointConstraint': FixedPointConstraint,
         })
         # Saving trained model to trained_models/trigger_chain_stats_baselinesubstractor_tdscan11_threshold0_model.keras...
-        # Saving training history to trained_models/trigger_chain_stats_baselinesubstractor_tdscan11_threshold0_history.npy...
-        # load the history if exists
-        history_path = self.model_path.replace("_model.keras", "_history.npy")
-        if os.path.exists(history_path):
-            history = np.load(history_path, allow_pickle=True).item()
+        # Saving training history to trained_models/trigger_chain_stats_baselinesubstractor_tdscan11_threshold0_history.json...
+        # load the training-history sidecar if it exists (JSON; never unpickled by default)
+        stem = self.model_path.replace("_model.keras", "")
+        history = None
+        if os.path.exists(stem + "_history.json"):
+            history = load_history(stem + "_history.json")
+        elif os.path.exists(stem + "_history.npy"):
+            if trust_legacy_history:
+                history = load_legacy_npy_history(stem + "_history.npy")
+            else:
+                print(f"Ignoring legacy history {stem}_history.npy: it is a pickle, and loading it "
+                      "can execute code. Pass trust_legacy_history=True if you made this file.")
+        if history is not None:
             self.model.history = tf.keras.callbacks.History()
             self.model.history.history = history
         self.model.summary()
@@ -353,7 +384,12 @@ class TriggerChain:
     if loss is None:
         # Plain Binary Cross Entropy; trigger-rate tuning is handled later from
         # the saved pre-threshold score distribution.
-        loss = tf.keras.losses.BinaryCrossentropy(from_logits=True, label_smoothing=0.0)
+        # A chain ending in a TrainableThreshold / OrMerge already outputs a
+        # probability (sigmoid or 0/1 bit): applying from_logits=True would take
+        # a second sigmoid and distort the loss.
+        outputs_probability = isinstance(self.model.layers[-1], (TrainableThreshold, OrMerge))
+        loss = tf.keras.losses.BinaryCrossentropy(
+            from_logits=not outputs_probability, label_smoothing=0.0)
     
     # pass over each layer and show the weight of tdscan and trainable threhsold taking into account the quantization if enabled
     for layer in self.model.layers:
@@ -378,7 +414,7 @@ class TriggerChain:
             optimizer=optimizer,
             loss=loss,
             metrics=[tf.keras.metrics.Recall(name="gamma_recall"),
-                    tf.keras.metrics.Accuracy(name="accuracy"),
+                    tf.keras.metrics.BinaryAccuracy(name="accuracy"),
             # NSBRateHz(window_size_ns=self.window_size, name="nsb_hz", hard=True),
             # TauMetric(self.model.get_layer("trainable_threshold"), name="tau"),
             ])
@@ -408,41 +444,13 @@ class TriggerChain:
                 outputs=self.last_layer
             )
 
-    # autoencoder loss: sum over time axis to match true_image shape
-    def _collapse_pred(y_pred):
-        y_pred = tf.cast(y_pred, tf.float32)
-        if y_pred.shape.rank == 4:
-            # (B, N, T, C) -> sum over time -> (B, N, C)
-            y_img = tf.reduce_sum(y_pred, axis=2)
-            # reduce channels if needed
-            if y_img.shape.rank == 3:
-                if y_img.shape[-1] == 1:
-                    y_img = tf.squeeze(y_img, axis=-1)
-                else:
-                    y_img = tf.reduce_sum(y_img, axis=-1)
-            return y_img
-        if y_pred.shape.rank == 3:
-            # (B, N, T) -> (B, N)
-            return tf.reduce_sum(y_pred, axis=2)
-        if y_pred.shape.rank == 2:
-            return y_pred
-        # fallback: flatten everything but batch
-        return tf.reshape(y_pred, (tf.shape(y_pred)[0], -1))
-
-    def reconstruction_mse(y_true, y_pred):
-        y_true_f = tf.cast(y_true, tf.float32)
-        if y_true_f.shape.rank > 2:
-            y_true_f = tf.reshape(y_true_f, (tf.shape(y_true_f)[0], -1))
-        y_pred_img = _collapse_pred(y_pred)
-        return tf.reduce_mean(tf.square(y_true_f - y_pred_img), axis=-1)
-
-    def recon_mse_metric(y_true, y_pred):
-        return reconstruction_mse(y_true, y_pred)
-
+    # Registered (serializable) classes: nested functions here made every saved
+    # autoencoder model impossible to reload.
+    from triggerkit.training.losses import ReconstructionMSE, ReconstructionMSEMetric
     if loss is None:
-        loss = reconstruction_mse
+        loss = ReconstructionMSE()
     if metrics is None:
-        metrics = [recon_mse_metric]
+        metrics = [ReconstructionMSEMetric()]
 
     if optimizer is None:
         optimizer = (
@@ -468,33 +476,40 @@ class TriggerChain:
         return
     
     history = self.model.history
-    # Plot training & validation accuracy values
-    plt.figure(figsize=(12, 8))
-    plt.subplot(2, 1, 1)
-    plt.plot(history.history['gamma_recall'])
-    plt.plot(history.history['val_gamma_recall'])
-    plt.title('Model Gamma Recall')
-    plt.ylabel('Gamma Recall')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-    plt.subplot(2, 1, 2)
-    plt.plot(history.history['nsb_hz'])
-    plt.plot(history.history['val_nsb_hz'])
-    plt.title('Model NSB Rate Hz (hard)')
-    plt.ylabel('NSB Rate Hz')
-    plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
-    plt.tight_layout()
-    plt.show()
-    plt.close()
+    hist = history.history
+    # Plot only what the compiled model actually logged (nsb_hz is optional).
+    panels = [
+        ("gamma_recall", "Model Gamma Recall", "Gamma Recall"),
+        ("nsb_hz", "Model NSB Rate Hz (hard)", "NSB Rate Hz"),
+    ]
+    panels = [p for p in panels if p[0] in hist]
+    if panels:
+        plt.figure(figsize=(12, 4 * len(panels)))
+        for i, (key, title, ylabel) in enumerate(panels, start=1):
+            plt.subplot(len(panels), 1, i)
+            plt.plot(hist[key])
+            legend = ['Train']
+            if f"val_{key}" in hist:
+                plt.plot(hist[f"val_{key}"])
+                legend.append('Validation')
+            plt.title(title)
+            plt.ylabel(ylabel)
+            plt.xlabel('Epoch')
+            plt.legend(legend, loc='upper left')
+        plt.tight_layout()
+        plt.show()
+        plt.close()
     # print the loss values
     plt.figure(figsize=(12, 4))
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
+    plt.plot(hist['loss'])
+    legend = ['Train']
+    if 'val_loss' in hist:
+        plt.plot(hist['val_loss'])
+        legend.append('Validation')
     plt.title('Model Loss')
     plt.ylabel('Loss')
     plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
+    plt.legend(legend, loc='upper left')
     plt.tight_layout()
     plt.show()
     plt.close()
@@ -519,6 +534,7 @@ class TriggerChain:
         callbacks=None,
         verbose=1,
         dataset=None,
+        count_samples=False,
     ):
 
     # check the folder exist
@@ -550,8 +566,8 @@ class TriggerChain:
         )
     train_ds, val_ds = dataset.train_val_datasets()
 
-    if callbacks is None:
-        callbacks = []
+    # copy: never append our internal callbacks to the caller's own list
+    callbacks = [] if callbacks is None else list(callbacks)
 
     # Graceful Ctrl+C: finish current epoch then stop (skip full-model save to avoid crashes).
     stop_flags = {"requested": False}
@@ -567,15 +583,13 @@ class TriggerChain:
             if stop_flags["requested"]:
                 print("Stopping requested by user; ending training after this epoch.")
                 self.model.stop_training = True
-    try:
-        tdscan_layer: TDSCAN = self.model.get_layer("tdscan")
-        tdscan_cb = TDSCANController.TDSCANController(
+    # by type, not by the literal name "tdscan": a second chain built in the same
+    # process names its layer "tdscan_1", "tdscan_2", ...
+    for tdscan_layer in (l for l in self.model.layers if isinstance(l, TDSCAN)):
+        callbacks.append(TDSCANController.TDSCANController(
             tdscan_layer=tdscan_layer,
             model=self.model
-        )
-        callbacks.append(tdscan_cb)
-    except ValueError:
-        pass
+        ))
 
     # Always keep a safe checkpoint at the end of each epoch (weights only to reduce size/fragility).
     ckpt_path = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="weights_only.weights.h5")
@@ -623,7 +637,7 @@ class TriggerChain:
     print("Datasets loaded.")
 
     # add grad_norm_logger callback to log the gradient norms of each layer during training
-    grad_norm_logger = GradNormLogger(sample_ds=train_ds_waveform.take(1000))
+    grad_norm_logger = GradNormLogger(sample_ds=train_ds_waveform.take(1000), verbose=verbose)
     callbacks.append(grad_norm_logger)
     # print the size of each dataset and distribution of labels
     def print_dataset_info(ds, name):
@@ -637,10 +651,13 @@ class TriggerChain:
             gamma_count += np.count_nonzero(lbl == 1)
             nsb_count += np.count_nonzero(lbl == 0)
         print(f"{name} dataset: {total} samples, {gamma_count} gamma, {nsb_count} nsb")
-    print_dataset_info(train_ds_waveform, "Training")
-    if val_ds_waveform is not None:
-        print_dataset_info(val_ds_waveform, "Validation")
-    else:
+    # Counting streams the whole dataset once more before training starts (a
+    # full extra read pass when load_ram=False), so it is opt-in.
+    if count_samples:
+        print_dataset_info(train_ds_waveform, "Training")
+        if val_ds_waveform is not None:
+            print_dataset_info(val_ds_waveform, "Validation")
+    if val_ds_waveform is None:
         print("No validation split (percent_validation=0 or empty fold).")
 
     print("Starting training...")
@@ -690,9 +707,9 @@ class TriggerChain:
             history_dict = self.model.history.history
 
         if history_dict is not None:
-            save_path_history = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="history.npy")
+            save_path_history = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="history.json")
             print(f"Saving training history to {save_path_history}...")
-            np.save(save_path_history, history_dict)
+            save_history(save_path_history, history_dict)
         else:
             print("No training history available to save.")
 
@@ -755,8 +772,9 @@ class TriggerChain:
     num_files = len(gamma_files)
     num_val_files = int(num_files * percent_validation)
 
-    gamma_files_train = gamma_files[:-num_val_files] if percent_validation > 0.0 else gamma_files
-    gamma_files_val = gamma_files[-num_val_files:] if percent_validation > 0.0 else []
+    # num_val_files == 0 must not slice with [:-0] (that is EMPTY, not "all").
+    gamma_files_train = gamma_files[:-num_val_files] if num_val_files > 0 else gamma_files
+    gamma_files_val = gamma_files[-num_val_files:] if num_val_files > 0 else []
 
     # --------------------------------------------------------------
     # Dataset builder for autoencoder
@@ -970,8 +988,7 @@ class TriggerChain:
     if val_ds is not None:
         val_ds = val_ds.map(pack, num_parallel_calls=tf.data.AUTOTUNE)
 
-    if callbacks is None:
-        callbacks = []
+    callbacks = [] if callbacks is None else list(callbacks)
 
     # Graceful Ctrl+C: finish current epoch then stop (skip full-model save to avoid crashes).
     stop_flags = {"requested": False}
@@ -988,15 +1005,13 @@ class TriggerChain:
                 print("Stopping requested by user; ending training after this epoch.")
                 self.model.stop_training = True
 
-    try:
-        tdscan_layer: TDSCAN = self.model.get_layer("tdscan")
-        tdscan_cb = TDSCANController.TDSCANController(
+    # by type, not by the literal name "tdscan": a second chain built in the same
+    # process names its layer "tdscan_1", "tdscan_2", ...
+    for tdscan_layer in (l for l in self.model.layers if isinstance(l, TDSCAN)):
+        callbacks.append(TDSCANController.TDSCANController(
             tdscan_layer=tdscan_layer,
             model=self.model
-        )
-        callbacks.append(tdscan_cb)
-    except ValueError:
-        pass
+        ))
 
     # Always keep a safe checkpoint at the end of each epoch (weights only to reduce size/fragility).
     ckpt_path = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="weights_only.weights.h5")
@@ -1050,9 +1065,9 @@ class TriggerChain:
             history_dict = self.model.history.history
 
         if history_dict is not None:
-            save_path_history = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="history.npy")
+            save_path_history = self.generate_output_filename(folder=output_folder, base_name=base_name, suffix="history.json")
             print(f"Saving training history to {save_path_history}...")
-            np.save(save_path_history, history_dict)
+            save_history(save_path_history, history_dict)
         else:
             print("No training history available to save.")
 
@@ -1074,12 +1089,21 @@ class TriggerChain:
                          batch_size=4096,
                          tel_id_only=2,
                          nsb_roll_copies=0,
-                         nsb_skip_original_events=True,
+                         nsb_skip_original_events=False,
                          ignore_errors=True,
                          folds=None,
                          max_gamma_events=None,
                          max_nsb_events=None,
+                         overwrite=None,
                          ):
+    # overwrite: True -> replace an existing stats file, False -> abort, None ->
+    # ask on the terminal (and raise FileExistsError when there is no terminal,
+    # e.g. a batch job, instead of hanging/crashing on input()).
+    if nsb_skip_original_events and int(nsb_roll_copies) <= 0:
+        raise ValueError(
+            "nsb_skip_original_events=True with nsb_roll_copies=0 yields NO NSB "
+            "events (the originals are skipped and no rolled copies are made). "
+            "Set nsb_skip_original_events=False, or nsb_roll_copies>=1.")
     # Cross-validation folds (leakage detector). `folds` is an optional list of
     # augment.Fold; each pairs a gamma pixel-index permutation with an NSB one
     # (rotation / roll / shuffle -- see triggerkit.augment). All folds are written
@@ -1162,6 +1186,11 @@ class TriggerChain:
         """
         if shift == 0:
             return wf
+        # A shift >= the trace length would build a wider trace than the model
+        # expects; shifting by the full length already repeats the edge sample.
+        n_samples = wf.shape[-1]
+        if n_samples is not None:
+            shift = max(-n_samples, min(n_samples, shift))
         # Tile has no uint16 kernel on this TF build (raises UnimplementedError
         # at run time, not at trace time) -- do the tile/concat in int32.
         dtype = wf.dtype
@@ -1247,7 +1276,7 @@ class TriggerChain:
         tau = None
     # try to get the TDSCAN weights
     try:
-        tdscan_layer = self.model.get_layer("tdscan")
+        tdscan_layer = next(l for l in self.model.layers if isinstance(l, TDSCAN))
         if tdscan_layer.share_neighbors:
             kernel_rings = tdscan_layer.kernel_rings.numpy().flatten()
             print(f"TDSCAN weights (shared by ring):")
@@ -1277,9 +1306,14 @@ class TriggerChain:
 
     # check if the file already exists
     if os.path.exists(out_h5_path):
-        # ask user to confirm overwriting
-        answer = builtins.input(f"File {out_h5_path} already exists. Overwrite? (y/n): ")
-        if answer.lower() != 'y':
+        if overwrite is None:
+            if not sys.stdin or not sys.stdin.isatty():
+                raise FileExistsError(
+                    f"{out_h5_path} already exists and there is no terminal to ask; "
+                    "pass overwrite=True or overwrite=False.")
+            overwrite = builtins.input(
+                f"File {out_h5_path} already exists. Overwrite? (y/n): ").lower() == 'y'
+        if not overwrite:
             print("Aborting statistics computation.")
             return
 
@@ -1301,6 +1335,7 @@ class TriggerChain:
     signal.signal(signal.SIGTERM, _request_stop)
 
     trig_rate = None
+    writer_closed = False   # still False at exit after an error -> partial file
     all_stats = {}          # per-fold stats dict, keyed by fold name
     total_events = 0
 
@@ -1399,7 +1434,7 @@ class TriggerChain:
                   .prefetch(tf.data.AUTOTUNE))
 
             group_events = 0
-            for i_batch, (wf0, ped0, y, extra) in enumerate(ds):
+            for i_batch, (wf0, ped0, y, extra) in enumerate(iterate_batches(ds)):
                 y_np = y.numpy().astype(np.uint8)
                 group_events += len(y_np)
                 total_events += len(y_np)
@@ -1495,6 +1530,7 @@ class TriggerChain:
                         "n_pe":      n_pe_np[keep_mask],
                         "p_trig":    p_np[keep_mask],
                     }
+                    cols["triggered"] = trigger_ref_np[keep_mask].astype(np.uint8)
                     cols.update({k: v[keep_mask] for k, v in extra_np.items()})
                     if pre_threshold_score_np is not None:
                         cols[PRE_THRESHOLD_SCORE_DATASET] = pre_threshold_score_np[keep_mask]
@@ -1563,6 +1599,7 @@ class TriggerChain:
 
         if not stop_flags["interrupted"]:
             trig_rate = writer.close(window_sec=self.window_size)
+            writer_closed = True
             print(f"Wrote {out_h5_path}  ({len(fold_plan)} fold(s))")
             print(f"NSB trigger rate (fold 0) = {trig_rate:.1f} Hz")
             print(f"Trigger chain info: {self._format_chain_for_log(trigger_chain_info)}")
@@ -1571,7 +1608,7 @@ class TriggerChain:
         print("Interrupted immediately by user; partial stats will be discarded.")
     finally:
         # Ensure file handles are closed before cleanup.
-        if stop_flags["interrupted"] and hasattr(writer, "close"):
+        if (stop_flags["interrupted"] or not writer_closed) and hasattr(writer, "close"):
             try:
                 writer.close(window_sec=self.window_size)
             except Exception:
@@ -1605,7 +1642,7 @@ class TriggerChain:
                     child.join(timeout=10)
 
         # Delete partial file if run was interrupted
-        if stop_flags["interrupted"] and os.path.exists(out_h5_path):
+        if (stop_flags["interrupted"] or not writer_closed) and os.path.exists(out_h5_path):
             try:
                 os.remove(out_h5_path)
                 print(f"Removed partial statistics file: {out_h5_path}")
@@ -1618,7 +1655,8 @@ class TriggerChain:
     # Return per-fold stats. For a plain single-pass run (folds=None) return that
     # one fold's dict directly, preserving the old return contract.
     for st in all_stats.values():
-        st["trigger_rate_hz"] = trig_rate
+        # each fold's own NSB rate (trig_rate is only fold 0's)
+        st["trigger_rate_hz"] = st["nsb_rate_hz"] if trig_rate is not None else None
     if folds is None:
         return all_stats.get("all", {})
     return all_stats
@@ -1667,50 +1705,16 @@ class TriggerChain:
     return tf.reshape(tf.reduce_max(score, axis=axes), (-1,))
 
   def _pick_tau_from_empirical_scores(self, scores, desired_fraction, comparison="gt"):
-    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-    if scores.size == 0:
-        return None, None, None
-
-    desired_fraction = float(np.clip(desired_fraction, 0.0, 1.0))
-    comparison = TrainableThreshold.normalize_comparison(comparison)
-    unique_scores, counts = np.unique(scores, return_counts=True)
-    counts = counts.astype(np.int64)
-    total = int(scores.size)
-
-    cumulative = np.cumsum(counts, dtype=np.int64)
-    counts_gt = total - cumulative
-    counts_ge = counts_gt + counts
-
-    if comparison == "ge":
-        tau_strict = np.nextafter(unique_scores.astype(np.float32), np.float32(np.inf))
-        tau_include_ties = unique_scores.astype(np.float32)
-    else:
-        tau_strict = unique_scores.astype(np.float32)
-        tau_include_ties = np.nextafter(unique_scores.astype(np.float32), np.float32(-np.inf))
-
-    candidate_taus = np.concatenate([tau_strict, tau_include_ties])
-    candidate_fractions = np.concatenate([
-        counts_gt.astype(np.float64) / total,
-        counts_ge.astype(np.float64) / total,
-    ])
-    candidate_modes = np.concatenate([
-        np.zeros_like(counts_gt, dtype=np.uint8),
-        np.ones_like(counts_ge, dtype=np.uint8),
-    ])
-
-    errors = np.abs(candidate_fractions - desired_fraction)
-    best_error = float(np.min(errors))
-    best_indices = np.flatnonzero(np.isclose(errors, best_error, rtol=0.0, atol=1e-12))
-
-    # If both sides of a plateau are equally good, prefer the lower tau so the
-    # final hard trigger does not systematically undershoot on quantized scores.
-    best_include_ties = best_indices[candidate_modes[best_indices] == 1]
-    best_idx = int(best_include_ties[0] if best_include_ties.size > 0 else best_indices[0])
-
-    mode = "score >= bin" if candidate_modes[best_idx] == 1 else "score > bin"
-    return float(candidate_taus[best_idx]), float(candidate_fractions[best_idx]), mode
+    # Shared with StatPlotter (single implementation): see
+    # triggerkit.Statistics.metrics.pick_threshold_from_scores.
+    return pick_threshold_from_scores(scores, desired_fraction, comparison)
 
   def find_threshold_for_target_rate(self, target_rate_hz, tolerance_hz=2, N_event_esimate_threshold=25_000, batch_size=4096, nsb_skip_original_events=True, nsb_roll_copies=1):
+    """Estimate the tau giving ``target_rate_hz`` on NSB events (does NOT assign it).
+
+    Returns ``(tau, predicted_rate_hz)``. Despite its name, ``tolerance_hz`` is a
+    PERCENTAGE of the target rate (2 -> +-2 %), kept for backward compatibility.
+    """
     cfg = SimTelTFDatasetConfig(
         batch_size=batch_size,
         shuffle_samples=False,
@@ -1795,7 +1799,7 @@ class TriggerChain:
         nsb_scores = []
         nsb_seen = 0
 
-        for i_batch, (inp, y, extra) in enumerate(dataset_nsb):
+        for i_batch, (inp, y, extra) in enumerate(iterate_batches(dataset_nsb)):
             # Forward pass until just before the threshold layer
             x = pre_threshold_model(inp, training=False)
             x = self._collapse_scores_to_event_scores(x)
@@ -1930,7 +1934,7 @@ class TriggerChain:
 
     nsb_rows, gamma_rows = [], []
     nsb_seen = 0
-    for inp, y in ds:
+    for inp, y in iterate_batches(ds):
         outs = branch_score_model(inp, training=False)
         # Collapse each branch's output to one score per event, stack to (B, n_branches).
         cols = [self._collapse_scores_to_event_scores(o).numpy().astype(np.float32) for o in outs]
@@ -2196,7 +2200,7 @@ class TriggerChain:
     rangenpe=None,
     rangenpe2=None, # in case we search for an event captured by two 2 different telescopes
     skip_first_n_events=-1,
-    time_roll=0,  # circular roll (samples) of the raw waveform on the time axis before the chain -- mirrors the gamma_time_shift CV fold augmentation
+    time_roll=0,  # edge-hold time shift (samples) of the raw waveform before the chain (NOT circular) -- mirrors the gamma_time_shift CV fold augmentation
     generate_image_gif=False,
     # limit_telescope=None, # to limit the number of telescope for each event, if 1, 
     cmap='inferno',
@@ -2256,6 +2260,7 @@ class TriggerChain:
         def _edge_hold_shift_np(wf, shift):
             if shift == 0:
                 return wf
+            shift = max(-wf.shape[1], min(wf.shape[1], shift))
             if shift > 0:
                 pad = np.repeat(wf[:, 0:1], shift, axis=1)
                 return np.concatenate([pad, wf[:, :-shift]], axis=1)
@@ -2906,9 +2911,9 @@ class TriggerChain:
     events_rendered = 0
 
     while events_rendered < n_events:
-        current_skip = base_skip
-        if current_skip is not None and current_skip >= 0:
-            current_skip = base_skip + events_rendered
+        # base_skip=-1 means "skip nothing" == 0; either way the k-th rendered
+        # event must skip the k events already shown, or n_events>1 repeats one.
+        current_skip = max(base_skip, 0) + events_rendered
 
         wf_r0_list_telescope, wf_r1_list_telescope, dl0_list_telescope, dl1_list_telescope, true_image_list_telescope, pedestal_per_sample_list_telescope, stat_event = self.search_event(
             event_id=event_id,

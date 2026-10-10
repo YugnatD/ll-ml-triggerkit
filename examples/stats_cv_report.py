@@ -46,90 +46,27 @@ import sys
 import h5py
 import numpy as np
 
-from triggerkit.Statistics.StatPlotter import wilson
-from triggerkit.Statistics.metrics import roc_auc_mann_whitney
+from triggerkit.Statistics.folds import read_folds_group
 
 DEFAULT_FOLDERS = ["simu_sst1m_tel2_tdscan", "simu_sst1m_tel2_hexcnn"]
 OUTPUT_DIR = "trigger_report"
 N_SIGMA = 3.0   # a fold outside fold-0's band by more than this is flagged
 
 
-def _auc_se(auc, n_pos, n_neg):
-    """Hanley & McNeil standard error of an AUC (exponential-distribution form)."""
-    if not np.isfinite(auc) or n_pos < 1 or n_neg < 1:
-        return float("nan")
-    q1 = auc / (2.0 - auc)
-    q2 = 2.0 * auc * auc / (1.0 + auc)
-    var = (auc * (1 - auc)
-           + (n_pos - 1) * (q1 - auc * auc)
-           + (n_neg - 1) * (q2 - auc * auc)) / (n_pos * n_neg)
-    return float(np.sqrt(max(var, 0.0)))
-
-
-def _fold_aucs(f, n_folds):
-    """Per-fold AUC + standard error from the per-event pre-threshold scores.
-
-    Returns a list of (auc, se) of length n_folds, all NaN when the file stores
-    no pre-threshold score (then the report falls back to gamma efficiency).
-    """
-    out = [(float("nan"), float("nan"))] * n_folds
-    if "events" not in f or not bool(f.attrs.get("has_pre_threshold_score", False)):
-        return out
-    ev = f["events"]
-    if "pre_threshold_score" not in ev:
-        return out
-    fold = ev["fold"][()]
-    label = ev["label"][()]
-    score = ev["pre_threshold_score"][()]
-    for i in range(n_folds):
-        m = fold == i
-        pos = score[m & (label == 1)]
-        neg = score[m & (label == 0)]
-        auc = roc_auc_mann_whitney(pos, neg)
-        out[i] = (auc, _auc_se(auc, pos.size, neg.size))
-    return out
-
-
 def _read_file(path):
-    """Return the list of per-fold summary dicts stored in one stats HDF5.
-
-    Each statistics run now writes ALL its folds into one file: a `/folds` group
-    holds parallel arrays (name, counts, rate, efficiency) indexed by the `fold`
-    column in /events. Returns [] for a file with no `/folds` group (e.g. an old
-    single-fold file written before this layout)."""
+    """Per-fold summary dicts of one stats HDF5 (see ``triggerkit.Statistics.folds``),
+    tagged with the file's chain and camera. [] for a file with no `/folds` group."""
+    folds = read_folds_group(path)
+    if not folds:
+        return []
     def s(x):
         return x.decode() if isinstance(x, bytes) else str(x)
     with h5py.File(path, "r") as f:
-        if "folds" not in f:
-            return []
-        g = f["folds"]
-        a = f.attrs
-        chain = s(a.get("trigger_chain_json", "?"))
-        camera = s(a.get("camera_name", "?"))
-        window_sec = float(a.get("window_sec", 75e-9))
-        names = [s(x) for x in g["name"][()]]
-        gt = g["gamma_trig"][()]; gtot = g["gamma_total"][()]
-        nt = g["nsb_trig"][()];   ntot = g["nsb_total"][()]
-        rate = g["trigger_rate_hz"][()]
-        aucs = _fold_aucs(f, len(names))
-        recs = []
-        for i, name in enumerate(names):
-            recs.append({
-                "index": i,
-                "auc": aucs[i][0],
-                "auc_err": aucs[i][1],
-                "path": path,
-                "fold": name,
-                "chain": chain,
-                "camera": camera,
-                "window_sec": window_sec,
-                "gamma_trig": int(gt[i]),
-                "gamma_total": int(gtot[i]),
-                "nsb_trig": int(nt[i]),
-                "nsb_total": int(ntot[i]),
-                "rate_hz": float(rate[i]),
-            })
-        return recs
+        chain = s(f.attrs.get("trigger_chain_json", "?"))
+        camera = s(f.attrs.get("camera_name", "?"))
+    for r in folds:
+        r.update(path=path, chain=chain, camera=camera)
+    return folds
 
 
 def _collect(folders):
@@ -144,17 +81,6 @@ def _collect(folders):
             for rec in _read_file(os.path.join(folder, fn)):
                 groups.setdefault(rec["chain"], []).append(rec)
     return groups
-
-
-def _summarize(folds):
-    """Attach efficiency and rate (value + Wilson error) to each fold."""
-    for r in folds:
-        eff, elo, ehi = wilson(r["gamma_trig"], r["gamma_total"])
-        r["eff"], r["eff_err"] = eff, max(elo, ehi)
-        # Rate error from the NSB Wilson band scaled by 1/window.
-        _, rlo, rhi = wilson(r["nsb_trig"], r["nsb_total"])
-        r["rate_err"] = max(rlo, rhi) / r["window_sec"]
-    return folds
 
 
 def _verdict(folds, key, err_key):
@@ -216,7 +142,6 @@ def main():
         # Sort by the fold's declaration index, NOT its name: folds[0] is the
         # reference fold every verdict is measured against.
         folds.sort(key=lambda r: (r["path"], r["index"]))
-        _summarize(folds)
         cam = folds[0]["camera"]
         print(f"\n=== {cam} | {len(folds)} folds ===")
         print(f"{'fold':<32}{'AUC':>18}{'gamma_eff':>16}{'nsb_rate_hz':>18}")

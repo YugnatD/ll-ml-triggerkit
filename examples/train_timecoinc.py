@@ -55,10 +55,12 @@ def main():
     print(f"{len(GAMMA)} runs gamma, {len(NSB)} run nsb, share={SHARE!r}, "
          f"epochs={EPOCHS}, lr={LR:.2g}, keep_abs_time={KEEP_ABS_TIME}")
 
+    # train budgets, also used below to size the LR schedule
+    GAMMA_TRAIN, NSB_TRAIN = 100_000, 100_000
     dataset = TriggerDataset(
         GAMMA, NSB,
         batch_size=BATCH, percent_validation=0.2, tel_id_only=1,
-        max_gamma_samples_train=100_000, max_nsb_samples_train=100_000,
+        max_gamma_samples_train=GAMMA_TRAIN, max_nsb_samples_train=NSB_TRAIN,
         max_gamma_samples_val=20_000, max_nsb_samples_val=20_000,
         load_ram=True, seed=SEED,
     )
@@ -84,12 +86,10 @@ def main():
     threshold.tau.assign(init_tau)
     threshold.set_trainable(False)
 
-    inputs = (chain.input_layer if chain.camera_name == "DigiCam_R0Alpha"
-              else [chain.input_layer, chain.input_baseline])
-    chain.model = tf.keras.Model(inputs=inputs, outputs=score)
-    # steps/epoch = min(gamma, nsb) budget / batch ; a wrong count makes the
+    chain.model = tf.keras.Model(inputs=chain.model_inputs(), outputs=score)
+    # steps/epoch = (gamma + nsb) train budget / batch ; a wrong count makes the
     # cosine hit its floor halfway and the run trains at ~0 lr for the rest
-    STEPS = 100_000 * 2 // BATCH
+    STEPS = (GAMMA_TRAIN + NSB_TRAIN) // BATCH
     sched = tf.keras.optimizers.schedules.CosineDecay(LR, EPOCHS * STEPS, alpha=0.01)
     chain.model.compile(
         optimizer=tf.keras.optimizers.Adam(sched),
@@ -142,7 +142,12 @@ def main():
     o = np.argsort(s_all); r = np.empty(len(s_all)); r[o] = np.arange(1, len(s_all) + 1)
     n1, n0 = y_all.sum(), (1 - y_all).sum()
     auc = (r[y_all == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
-    print(f">>> AUC GLOBALE sur {int(n1)} gammas + {int(n0)} nsb : {max(auc, 1-auc):.4f}")
+    # Reported as is, NOT max(auc, 1-auc): that would show an inverted score
+    # (a sign bug) as a good result.
+    print(f">>> AUC GLOBALE sur {int(n1)} gammas + {int(n0)} nsb : {auc:.4f}")
+    if auc < 0.5:
+        print(f"    ATTENTION : AUC < 0.5, le score est inverse (1-AUC = {1 - auc:.4f}) -- "
+              "verifier le signe du score / des labels.")
     print("    reference : 0.7126 (bac a sable, meme archi sans tache auxiliaire)")
     print("    TDSCAN sur le meme decoupage : 0.6957")
 

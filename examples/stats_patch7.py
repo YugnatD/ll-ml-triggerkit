@@ -78,6 +78,10 @@ def main():
         tolerance_hz=2,
         N_event_esimate_threshold=stats_common.threshold_events(args),
         batch_size=1024,
+        # same NSB sample compute_statistics evaluates below: the originals,
+        # not the rolled copies find_threshold_for_target_rate defaults to
+        nsb_skip_original_events=False,
+        nsb_roll_copies=0,
     )
     print(f"tau={tau}  predicted_rate={predicted_rate} Hz (frozen for all folds)")
     threshold_layer.tau.assign(tau)

@@ -8,9 +8,11 @@ of the sandbox's ``train_utils.py``; behaviour unchanged.
 import numpy as np
 import tensorflow as tf
 
+from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
     SimTelTFDataset,
+    iterate_batches,
     SimTelTFDatasetConfig,
 )
 
@@ -46,13 +48,9 @@ def _default_calib_config():
 
 def _score_distributions(chain, score_tensor, gamma_files, config):
     """Run a forward pass and split pre-threshold scores into gamma / NSB."""
-    if chain.camera_name == "DigiCam_R0Alpha":
-        pre_inputs = chain.input_layer
-        pack_inputs = lambda wf, ped: wf
-    else:
-        pre_inputs = [chain.input_layer, chain.input_baseline]
-        pack_inputs = lambda wf, ped: (wf, ped)
-    pre_threshold_model = tf.keras.Model(inputs=pre_inputs, outputs=score_tensor)
+    gamma_files = normalize_files(gamma_files, name="gamma_files", require_nonempty=True)
+    pre_threshold_model = tf.keras.Model(inputs=chain.model_inputs(), outputs=score_tensor)
+    pack_inputs = chain.pack_model_inputs
 
     ds = SimTelTFDataset(
         gamma_files=gamma_files[: max(2, min(4, len(gamma_files)))],
@@ -62,11 +60,13 @@ def _score_distributions(chain, score_tensor, gamma_files, config):
     ).dataset()
 
     scores_g, scores_n = [], []
-    for feat, lbl in ds:
+    for feat, lbl in iterate_batches(ds):
         wf = tf.reshape(tf.cast(feat["waveform"], tf.uint16),
                         (-1, chain.num_pixels, chain.num_samples))
         ped = tf.reshape(tf.cast(feat["pedestal"], tf.int32), (-1, chain.num_pixels))
-        scores = pre_threshold_model(pack_inputs(wf, ped), training=False).numpy().reshape(-1)
+        scores = pre_threshold_model(pack_inputs(wf, ped), training=False).numpy()
+        # (B,) or (B, F) multi-filter scores -> one value per event (best filter)
+        scores = scores.reshape(scores.shape[0], -1).max(axis=1)
         l = lbl.numpy().reshape(-1)
         scores_g.extend(scores[l == 1].tolist())
         scores_n.extend(scores[l == 0].tolist())

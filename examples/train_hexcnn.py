@@ -27,6 +27,7 @@ import tensorflow as tf
 import keras_hexagdly as hgly
 
 from triggerkit import training
+from triggerkit.Helper.history import save_history
 from triggerkit.data import TriggerDataset
 from triggerkit.models import (
     GlobalHexMean,
@@ -70,9 +71,8 @@ def make_body():
 
 
 def _train_inputs(chain):
-    if chain.camera_name == "DigiCam_R0Alpha":
-        return chain.input_layer
-    return [chain.input_layer, chain.input_baseline]
+    """The chain's model inputs: the waveform, plus the baseline when a fadc stage wired it in."""
+    return chain.model_inputs()
 
 
 def main():
@@ -187,8 +187,8 @@ def main():
 
     if hist:
         history_path = chain.generate_output_filename(
-            folder="trained_models", base_name="hexcnn_trigger", suffix="history.npy")
-        np.save(history_path, hist)
+            folder="trained_models", base_name="hexcnn_trigger", suffix="history.json")
+        save_history(history_path, hist)
         print(f"Saved training history to {history_path}")
 
 

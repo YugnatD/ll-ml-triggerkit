@@ -63,16 +63,23 @@ class FileOpenerCTAOHDF5:
             self.lst_tel = [
                 key for key in self.src["r1/event/telescope"].keys()
             ]  # [tel_001, tel_002, tel_003, tel_004]
-        self.lst_tel_ids = subarray["layout"]["tel_id"].tolist()  # [1, 2, 3, 4]
+        layout_tel_ids = subarray["layout"]["tel_id"].tolist()  # [1, 2, 3, 4]
+        # Telescope id of each key in lst_tel, taken from the key itself
+        # ("tel_002" -> 2). Pairing lst_tel with the layout list BY POSITION is
+        # only right when the file holds every telescope of the layout.
+        try:
+            self.lst_tel_ids = [int(k.split("_")[-1]) for k in self.lst_tel]
+        except ValueError:
+            self.lst_tel_ids = layout_tel_ids
         self.tel_positions = {}
         try:
             pos_x = subarray["layout"]["pos_x"]
             pos_y = subarray["layout"]["pos_y"]
             pos_z = subarray["layout"]["pos_z"]
-            for tel_id, x, y, z in zip(self.lst_tel_ids, pos_x, pos_y, pos_z):
+            for tel_id, x, y, z in zip(layout_tel_ids, pos_x, pos_y, pos_z):
                 self.tel_positions[int(tel_id)] = (float(x), float(y), float(z))
         except Exception:
-            for tel_id in self.lst_tel_ids:
+            for tel_id in layout_tel_ids:
                 self.tel_positions[int(tel_id)] = (-1.0, -1.0, -1.0)
         # access the members of the subarray
         # for key in subarray.keys():
@@ -218,8 +225,6 @@ class FileOpenerCTAOHDF5:
                     for tel_idx, tel_name in enumerate(self.lst_tel):
                         tel_id = self.lst_tel_ids[tel_idx]
                         tel_pos_x, tel_pos_y, tel_pos_z = self.tel_positions.get(int(tel_id), (-1.0, -1.0, -1.0))
-                        # get the real telescope id
-                        tel_ids.append(tel_id)
 
                         # try getting r0 group first
                         tel_group_r0 = None
@@ -274,6 +279,9 @@ class FileOpenerCTAOHDF5:
                         event_id = int(event["event_id"])
 
                         if event_id == min_event_id:
+                            # tel_ids must stay aligned with the waveform lists:
+                            # only telescopes present in THIS event are listed.
+                            tel_ids.append(tel_id)
                             # try to get the different waveforms
                             if tel_group_r0 is not None:
                                 waveform_r0 = self._normalize_waveform_no_channel(
@@ -344,7 +352,6 @@ class FileOpenerCTAOHDF5:
                                 # no calibration table for this telescope
                                 pedestal_per_sample_list.append(None)
                                 # dc_to_pe_list.append(None)
-                                true_image_list.append(None)
 
                             # event stats, now with energy (and other truth info)
                             stat_event = {

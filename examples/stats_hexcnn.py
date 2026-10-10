@@ -8,7 +8,7 @@ threshold-terminated model as one ``.keras`` file, and every custom layer
 ``register_keras_serializable``. So ``chain.compile_chain(model_path=...)`` just
 calls ``tf.keras.models.load_model`` under the hood and rebuilds the exact graph
 -- NO redefining the architecture, no ``make_body``, and no ``keras_hexagdly``
-import needed here. It even reloads the ``_history.npy`` sidecar if present.
+import needed here. It even reloads the ``_history.json`` sidecar if present.
 
     sandbox                                    triggerkit
     --------------------------------------------------------------------------
@@ -51,16 +51,16 @@ FOLD_EVENTS = (None, None)
 #                                  exact symmetry -- a multiple of 120 for this
 #                                  3-fold camera; other angles raise loudly
 #                                  rather than misplace pixels.
-#   gamma_time_shift [0]           circular roll of the GAMMA waveform in samples
+#   gamma_time_shift [0]           edge-hold time shift of the GAMMA waveform in samples
 #   nsb_kind         ["original"]  "original" / "rolled" / "shuffle"
 #   nsb_param        [None]        roll shift or shuffle seed (kind default if None)
-#   nsb_time_shift   [0]           circular roll of the NSB waveform in samples
+#   nsb_time_shift   [0]           edge-hold time shift of the NSB waveform in samples
 #   name             [auto]        explicit fold name
 # An unknown key raises, so typos surface immediately.
 #
-# The time-roll folds test whether the CNN leaked the absolute temporal position
-# of the pulse. Roll the gammas alone and the signal moves while tau stays tuned
-# on un-rolled NSB -- the classes are no longer treated alike. Roll BOTH by the
+# The time-shift folds test whether the CNN leaked the absolute temporal position
+# of the pulse. Shift the gammas alone and the signal moves while tau stays tuned
+# on unshifted NSB -- the classes are no longer treated alike. Shift BOTH by the
 # same amount for the fair test: a time-translation-invariant trigger returns the
 # same gamma efficiency AND the same NSB rate as the reference fold.
 FOLD_ROWS = [

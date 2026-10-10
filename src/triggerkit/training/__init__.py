@@ -14,6 +14,8 @@ from triggerkit.training.calibration import (
 )
 from triggerkit.training.callbacks import PerFilterAUCLogger, WeightStatsLogger
 from triggerkit.training.losses import (
+    ReconstructionMSE,
+    ReconstructionMSEMetric,
     make_pairwise_auc_loss,
     make_pairwise_auc_loss_multi,
     soft_or_scores,
@@ -48,6 +50,8 @@ __all__ = [
     "WeightStatsLogger",
     # calibration
     "calibrate_tau",
+    "ReconstructionMSE",
+    "ReconstructionMSEMetric",
     "_default_calib_config",
     "_score_distributions",
     # selection

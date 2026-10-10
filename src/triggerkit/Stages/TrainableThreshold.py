@@ -62,9 +62,15 @@ class TrainableThreshold(tf.keras.layers.Layer):
             raise ValueError("threshold comparison must be 'gt'/'>' or 'ge'/'>='.")
         return canonical
     
+    def _tau_value(self):
+        # tau only exists once the layer is built; before that report init_tau
+        tau = getattr(self, "tau", None)
+        if tau is None:
+            return float(self.init_tau)
+        return float(tau.numpy().flatten()[0])
+
     def stage_name(self):
-        # get actual tau value
-        tau_value = float(self.tau.numpy().flatten()[0])
+        tau_value = self._tau_value()
         suffix = ""
         if self.comparison == "ge":
             suffix += "ge"
@@ -76,7 +82,7 @@ class TrainableThreshold(tf.keras.layers.Layer):
         return "threshold"
     
     def get_params(self):
-        tau_value = float(self.tau.numpy().flatten()[0])
+        tau_value = self._tau_value()
         return {
             'threshold': tau_value,
             'binary': bool(self.binary_output),

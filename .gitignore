@@ -14,3 +14,4 @@ trained_models/
 *.npy
 *.h5
 *.hdf5
+*_history.json

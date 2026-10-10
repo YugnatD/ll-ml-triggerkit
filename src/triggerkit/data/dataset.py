@@ -14,11 +14,9 @@ Design points agreed for the package refactor:
 * NSB augmentation rule: a single NSB file is densified by a random per-batch
   circular pixel roll (``nsb_roll_augment``), exactly as ``train_chain`` already
   did. ``nsb_roll_copies`` (fixed +1,+2,... duplicates) is also exposed.
-* ``targets``: only ``("class",)`` (the binary gamma/NSB label) is wired today.
-  Auxiliary targets such as the true Cherenkov image are NOT emitted by the
-  streaming reader yet (``SimTelTFDataset`` opens files with
-  ``keep_true_image=False``), so requesting them raises ``NotImplementedError``
-  with a pointer rather than silently dropping them.
+* ``targets``: ``"class"`` (the binary gamma/NSB label, mandatory) plus the
+  auxiliary ``"true_image"`` and ``"peak_time"`` maps, which the streaming reader
+  emits on request. Any other target raises ``NotImplementedError``.
 * ``gated_by``: reserved for the TDSCAN->CNN cascade (train the downstream stage
   only on events that pass a frozen upstream chain). Not wired yet.
 * ``gamma_rotations``: reserved for hexagonal rotation augmentation. Rotation
@@ -29,6 +27,7 @@ Design points agreed for the package refactor:
 
 import warnings
 
+from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
     SimTelTFDataset,
@@ -73,8 +72,8 @@ class TriggerDataset:
         back to the tail ``percent_validation`` split. NSB files are shared
         across folds (the set is small and label-0 only).
     targets : tuple of str
-        Which targets the label pipeline should carry. Only ``("class",)`` is
-        implemented; other values raise ``NotImplementedError``.
+        Which targets the pipeline carries: ``"class"`` (mandatory), optionally
+        ``"true_image"`` / ``"peak_time"``. Other values raise ``NotImplementedError``.
     gated_by : TriggerChain or None
         Reserved for cascade training. Not implemented yet.
     gamma_rotations : tuple of int
@@ -109,8 +108,8 @@ class TriggerDataset:
         opener_cls=AsyncFileOpenerProcess,
         seed=1337,
     ):
-        self.gamma_files = list(gamma_files)
-        self.nsb_files = [nsb_files] if isinstance(nsb_files, str) else list(nsb_files)
+        self.gamma_files = normalize_files(gamma_files, name="gamma_files")
+        self.nsb_files = normalize_files(nsb_files, name="nsb_files")
 
         self.batch_size = batch_size
         self.tel_id_only = tel_id_only
@@ -188,6 +187,11 @@ class TriggerDataset:
                 return list(files), []
             n_val = int(len(files) * self.percent_validation)
             if n_val == 0:
+                warnings.warn(
+                    f"percent_validation={self.percent_validation} of {len(files)} gamma "
+                    "file(s) rounds to 0 validation files: there will be NO validation "
+                    "split. Pass more files or a larger percent_validation.",
+                    stacklevel=2)
                 return list(files), []
             return files[:-n_val], files[-n_val:]
 
@@ -196,6 +200,10 @@ class TriggerDataset:
         n = len(files)
         bounds = [round(i * n / self.n_folds) for i in range(self.n_folds + 1)]
         lo, hi = bounds[self.fold], bounds[self.fold + 1]
+        if hi <= lo:
+            warnings.warn(
+                f"fold {self.fold} of {self.n_folds} is empty ({n} gamma file(s)): "
+                "no validation split.", stacklevel=2)
         val = files[lo:hi]
         train = files[:lo] + files[hi:]
         return train, val

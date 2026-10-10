@@ -59,6 +59,7 @@ _REGISTRATION_MODULES = (
     "triggerkit.Stages.OrMerge",
     "triggerkit.Stages.DigitalSum",
     "triggerkit.Stages.MovingAverage",
+    "triggerkit.Stages.TrainSoftMaxPool2D",
     "triggerkit.Loss.RateConstrainedBCE",
     "triggerkit.Metric.NSBRateHz",
     "triggerkit.Metric.TauMetric",

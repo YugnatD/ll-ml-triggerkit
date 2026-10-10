@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 import numpy as np
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -14,11 +15,35 @@ import tensorflow as tf
 # imports tensorflow at top level would re-pay a full TF+CUDA init in every
 # spawned worker). Re-exported here since most of the codebase imports them
 # from this module.
+from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.AsyncFileOpener import (  # noqa: F401
     FileType,
     FileOpenerCTAO,
     AsyncFileOpenerProcess,
+    FileReadError,
 )
+
+
+def iterate_batches(dataset):
+    """Iterate a tf.data stream, turning a worker's read failure into ``FileReadError``.
+
+    tf.data wraps any exception raised inside a Python generator into a generic
+    ``tf.errors.UnknownError`` whose text merely contains the original one. This
+    wrapper re-raises it as :class:`FileReadError` (original text kept, cause
+    chained) so callers can ``except FileReadError`` instead of string-matching.
+    Other errors pass through untouched.
+    """
+    iterator = iter(dataset)
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        except tf.errors.OpError as exc:
+            if "FileReadError" in str(exc):
+                raise FileReadError(str(exc)) from exc
+            raise
+        yield item
 
 
 @dataclass
@@ -125,13 +150,9 @@ class SimTelTFDataset:
         opener_cls: Callable[..., Any],  # e.g. AsyncFileOpenerProcess
         config: Optional[SimTelTFDatasetConfig] = None,
     ):
-        self.gamma_files = list(gamma_files)
-
-        # -------- NEW: accept nsb_files as a single string/path safely --------
-        if isinstance(nsb_files, (str, os.PathLike)):
-            self.nsb_files = [str(nsb_files)]
-        else:
-            self.nsb_files = list(nsb_files)
+        # a path, a list/tuple of paths, or None -- always stored as a list of str
+        self.gamma_files = normalize_files(gamma_files, name="gamma_files")
+        self.nsb_files = normalize_files(nsb_files, name="nsb_files")
 
         self.opener_cls = opener_cls
         self.cfg = config or SimTelTFDatasetConfig()
@@ -284,7 +305,10 @@ class SimTelTFDataset:
                     features[key] = tf.where(is_nsb[:, None], m_rolled, m)
             return features, label
 
-        return ds.map(_roll_batch, num_parallel_calls=tf.data.AUTOTUNE)
+        # Sequential on purpose: the seeded Generator is stateful, so parallel
+        # calls would draw in a nondeterministic order and break the
+        # "reproducible for a given nsb_roll_seed" guarantee above.
+        return ds.map(_roll_batch, num_parallel_calls=1)
 
     # ---------- Internals ----------
 
@@ -450,6 +474,29 @@ class SimTelTFDataset:
         return ds
 
     def _iter_one_file(
+        self,
+        simtel_file: str,
+        label: int,
+        rng: np.random.Generator,
+    ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
+        """Stream one file; a file that cannot be read costs only itself.
+
+        A generator that raises is dead, and tf.data (or the RAM loader) would
+        then end the WHOLE dataset. So a FileReadError is confined here: with
+        ignore_errors the rest of that file is skipped (the opener already
+        warned loudly) and the other files keep streaming; otherwise it raises.
+        """
+        try:
+            yield from self._iter_one_file_unguarded(simtel_file, label, rng)
+        except FileReadError as exc:
+            if not self.cfg.ignore_errors:
+                raise
+            warnings.warn(
+                f"ignore_errors=True: skipping the unread rest of {simtel_file!r} "
+                f"and continuing with the other files ({str(exc).splitlines()[0]})",
+                RuntimeWarning, stacklevel=2)
+
+    def _iter_one_file_unguarded(
         self,
         simtel_file: str,
         label: int,

@@ -37,6 +37,7 @@ import numpy as np
 import tensorflow as tf
 
 from triggerkit import training
+from triggerkit.Helper.history import save_history
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.data import TriggerDataset
 from triggerkit.models import TDSCANBody, generate_lin_space_edges
@@ -113,10 +114,8 @@ def _tdscan_hw_kwargs():
 
 
 def _train_inputs(chain):
-    """The chain's model inputs (1 for DigiCam_R0Alpha, else waveform+baseline)."""
-    if chain.camera_name == "DigiCam_R0Alpha":
-        return chain.input_layer
-    return [chain.input_layer, chain.input_baseline]
+    """The chain's model inputs: the waveform, plus the baseline when a fadc stage wired it in."""
+    return chain.model_inputs()
 
 
 def main():
@@ -258,8 +257,8 @@ def main():
 
     if hist:
         history_path = chain.generate_output_filename(
-            folder="trained_models", base_name="trigger_chain", suffix="history.npy")
-        np.save(history_path, hist)
+            folder="trained_models", base_name="trigger_chain", suffix="history.json")
+        save_history(history_path, hist)
         print(f"Saved training history to {history_path}")
 
 

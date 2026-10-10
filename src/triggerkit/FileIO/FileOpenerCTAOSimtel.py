@@ -24,6 +24,12 @@ class FileOpenerCTAOSimtel:
         self.tel_positions = {}
         for tel_id in self.tel_ids:
             self.tel_positions[int(tel_id)] = self._extract_tel_position_xyz(self.src.subarray, int(tel_id))
+        # everything needed from this probe source is extracted: release the
+        # file handle (iteration re-opens its own EventSource in _open()).
+        try:
+            self.src.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_tel_position_xyz(subarray, tel_id: int) -> tuple[float, float, float]:

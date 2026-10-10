@@ -173,3 +173,58 @@ def soft_or_scores(branch_scores, taus, temps, name="soft_or"):
         raise ValueError("branch_scores, taus and temps must have the same length.")
 
     return SoftOr(taus=taus, temps=temps, name=name)(list(branch_scores))
+
+
+# ---------------------------------------------------------------------------
+# Autoencoder-style training: reconstruct the true Cherenkov image
+# ---------------------------------------------------------------------------
+
+def collapse_to_image(y_pred):
+    """Reduce a chain output to a per-pixel image ``(B, P)`` by summing over time.
+
+    ``(B, N, T, C)`` -> sum over T, then over C; ``(B, N, T)`` -> sum over T;
+    ``(B, N)`` is already an image; anything else is flattened per sample.
+    """
+    y_pred = tf.cast(y_pred, tf.float32)
+    rank = y_pred.shape.rank
+    if rank == 4:
+        img = tf.reduce_sum(y_pred, axis=2)                    # (B, N, C)
+        return tf.squeeze(img, axis=-1) if img.shape[-1] == 1 else tf.reduce_sum(img, axis=-1)
+    if rank == 3:
+        return tf.reduce_sum(y_pred, axis=2)                   # (B, N)
+    if rank == 2:
+        return y_pred
+    return tf.reshape(y_pred, (tf.shape(y_pred)[0], -1))
+
+
+def _per_sample_reconstruction_mse(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
+    if y_true.shape.rank > 2:
+        y_true = tf.reshape(y_true, (tf.shape(y_true)[0], -1))
+    return tf.reduce_mean(tf.square(y_true - collapse_to_image(y_pred)), axis=-1)
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class ReconstructionMSE(tf.keras.losses.Loss):
+    """Per-sample MSE between the true image and the time-summed chain output.
+
+    A registered class (not a closure inside ``compile_chain_autoencoder``), so a
+    compiled autoencoder model can be saved AND reloaded.
+    """
+
+    def __init__(self, name="reconstruction_mse", **kwargs):
+        super().__init__(name=name, **kwargs)
+
+    def call(self, y_true, y_pred):
+        return _per_sample_reconstruction_mse(y_true, y_pred)
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class ReconstructionMSEMetric(tf.keras.metrics.Mean):
+    """Running mean of :class:`ReconstructionMSE` (the autoencoder's monitored metric)."""
+
+    def __init__(self, name="recon_mse_metric", **kwargs):
+        super().__init__(name=name, **kwargs)
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        return super().update_state(_per_sample_reconstruction_mse(y_true, y_pred), sample_weight)

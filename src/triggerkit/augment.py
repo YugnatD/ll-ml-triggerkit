@@ -35,8 +35,10 @@ together (the baseline rotates with the camera).
 Temporal roll (a second fold axis)
 ----------------------------------
 A :class:`Fold` may ALSO carry a ``gamma_time_shift`` and an ``nsb_time_shift``
--- integer circular rolls of the waveform along the time-sample axis ``S``,
-applied per class (``compute_statistics`` uses ``tf.roll`` on the ``(B, P, S)``
+-- integer EDGE-HOLD shifts of the waveform along the time-sample axis ``S``
+(the vacated samples repeat the trace's own boundary sample; NOT a circular
+wrap, which fakes an edge TDSCAN fires on), applied per class
+(``compute_statistics`` uses ``edge_hold_shift`` on the ``(B, P, S)``
 waveform, NOT the ``(B, P)`` pedestal, which has no time axis). This is a
 *value* transform, orthogonal to the pixel index above: it moves the waveform in
 time to test whether the model leaked the absolute temporal position of the
@@ -56,6 +58,8 @@ rate even though NSB values are perfectly stationary in time.)
 
 import numpy as np
 
+from triggerkit.FileIO.paths import normalize_files
+
 
 def _pixel_pitch(x, y):
     """Median nearest-neighbour distance (numpy-only, no scipy)."""
@@ -70,7 +74,10 @@ def rotation_permutation(geometry, deg, *, tol_frac=0.1):
 
     Rotates every pixel position by ``deg`` about the camera centroid and maps it
     to the nearest original pixel. Returns an int ``(P,)`` array ``perm`` with
-    ``perm[p]`` = the pixel that pixel ``p`` lands on.
+    ``perm[p]`` = the pixel that pixel ``p`` lands on. Note the fold plumbing
+    applies it as a GATHER (``out[p] = in[perm[p]]``), i.e. the data is rotated
+    by ``-deg``; this is immaterial for a symmetry test but matters if you
+    compare fold names with a physical direction.
 
     Raises ``ValueError`` if ``deg`` is not an exact symmetry of *this* camera --
     i.e. the nearest-pixel map is not a bijection, or any pixel lands farther than
@@ -223,7 +230,8 @@ def make_condition_folds(geometry, conditions):
         folds.append(Fold(
             name, gamma_index=identity, nsb_index=identity,
             config={"condition": name},
-            gamma_files=list(gamma_files), nsb_files=list(nsb_files),
+            gamma_files=normalize_files(gamma_files, name=f"condition {name!r} gamma files"),
+            nsb_files=normalize_files(nsb_files, name=f"condition {name!r} nsb files"),
             max_gamma_events=gamma_events, max_nsb_events=nsb_events,
         ))
     return folds
@@ -233,10 +241,10 @@ def make_condition_folds(geometry, conditions):
 FOLD_SPEC_KEYS = {
     "name": None,                # optional explicit fold name (auto-derived if None)
     "gamma_deg": 0,              # camera rotation applied to gamma rows (degrees)
-    "gamma_time_shift": 0,       # circular roll of the gamma waveform, in samples
+    "gamma_time_shift": 0,       # edge-hold time shift of the gamma waveform, in samples
     "nsb_kind": "original",      # pixel transform for NSB: original / rolled / shuffle
     "nsb_param": None,           # roll shift or shuffle seed (kind-dependent)
-    "nsb_time_shift": 0,         # circular roll of the NSB waveform, in samples
+    "nsb_time_shift": 0,         # edge-hold time shift of the NSB waveform, in samples
 }
 
 #: Keys every dict-form fold spec MUST set itself -- no default, deliberately.
@@ -413,7 +421,7 @@ def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac
                 nsb_time_shift=nsb_time_shift,
                 max_gamma_events=gamma_events,
                 max_nsb_events=nsb_events,
-                gamma_files=list(gamma_files),
-                nsb_files=list(nsb_files),
+                gamma_files=normalize_files(gamma_files, name=f"condition {cond!r} gamma files"),
+                nsb_files=normalize_files(nsb_files, name=f"condition {cond!r} nsb files"),
             ))
     return folds
