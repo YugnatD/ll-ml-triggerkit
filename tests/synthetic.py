@@ -14,10 +14,12 @@ N_PIX, N_SAMPLES = 432, 50
 
 def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
                      tel_present=None, fill_with_tel_id=False, with_calibration=True,
-                     layout_tels=None):
+                     layout_tels=None, n_samples=N_SAMPLES, pulse_samples=(20, 25)):
     """Write one file. ``tel_present(event_index) -> iterable of tel ids`` controls which
     telescopes saw each event (default: all of ``tels``). ``fill_with_tel_id`` makes every
-    waveform sample equal to its telescope id, to check tel_id <-> waveform alignment."""
+    waveform sample equal to its telescope id, to check tel_id <-> waveform alignment.
+    ``n_samples`` is the datacube length; gamma pulses sit on samples ``pulse_samples``
+    (start, stop)."""
     rng = np.random.default_rng(seed)
     pos = sst1m.patch_positions()
     tel_present = tel_present or (lambda i: tels)
@@ -48,15 +50,15 @@ def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
             events = [i for i in range(n_events) if t in tel_present(i)]
             n = len(events)
             name = f"tel_{t:03d}"
-            r0 = np.zeros(n, dtype=[("event_id", "i8"), ("waveform", "u2", (1, N_PIX, N_SAMPLES))])
+            r0 = np.zeros(n, dtype=[("event_id", "i8"), ("waveform", "u2", (1, N_PIX, n_samples))])
             img = np.zeros(n, dtype=[("true_image", "f4", (N_PIX,)), ("true_image_sum", "f4")])
             cal = np.zeros(n, dtype=[("event_id", "i8"),
                                      ("waveformcalibration_pedestal_per_sample", "f4", (1, N_PIX))])
             for row, ev in enumerate(events):
-                wf = rng.normal(100, 3, (N_PIX, N_SAMPLES))
-                if kind == "gamma":                   # compact pulse of ~30 patches, samples 20..25
+                wf = rng.normal(100, 3, (N_PIX, n_samples))
+                if kind == "gamma":                   # compact pulse of ~30 patches, samples 20..24
                     centre = int(rng.integers(40, 392))
-                    wf[centre - 15:centre + 15, 20:25] += rng.uniform(40, 80)
+                    wf[centre - 15:centre + 15, pulse_samples[0]:pulse_samples[1]] += rng.uniform(40, 80)
                     img["true_image"][row, centre - 15:centre + 15] = 5.0
                     img["true_image_sum"][row] = 150.0
                 if fill_with_tel_id:

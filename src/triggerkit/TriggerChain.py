@@ -116,9 +116,15 @@ def _verify_model_reloads(model_path, ckpt_path=None):
 
 
 class TriggerChain:
-  def __init__(self, simtel_path, simtel_nsb_path=None):
+  def __init__(self, simtel_path, simtel_nsb_path=None, num_samples=None):
     """``simtel_path`` / ``simtel_nsb_path``: a path or a list/tuple of paths (``str`` or
-    ``pathlib.Path``). Both are stored as lists of ``str``; the NSB list may be empty."""
+    ``pathlib.Path``). Both are stored as lists of ``str``; the NSB list may be empty.
+
+    ``num_samples``: number of time samples the model takes as input. ``None`` (default)
+    uses the datacube length of the files. A smaller value builds a chain that sees only
+    a window of the datacube; the window is cut by :class:`triggerkit.cascade.TriggerCascade`
+    (``windows=``). Such a chain cannot read the files itself (training, statistics,
+    threshold search raise), since it would not know which samples to take."""
     self.simtel_path = normalize_files(simtel_path, name="simtel_path")
     self.simtel_nsb_path = normalize_files(simtel_nsb_path, name="simtel_nsb_path")
     # the geometry is read from the first gamma file (else the first NSB file)
@@ -150,6 +156,15 @@ class TriggerChain:
                 break
     if not hasattr(self, 'num_samples'):
         raise ValueError("Could not determine number of samples from the simtel file.")
+    # datacube length in the files; num_samples is what the model takes as input
+    self.file_num_samples = int(self.num_samples)
+    if num_samples is not None:
+        num_samples = int(num_samples)
+        if not 1 <= num_samples <= self.file_num_samples:
+            raise ValueError(
+                f"num_samples={num_samples} must be between 1 and the datacube length of "
+                f"the files ({self.file_num_samples}).")
+        self.num_samples = num_samples
     # open the necessary file depending on the camera type to get the sampling rate
     if self.camera_name == "DigiCam" or self.camera_name == "DigiCam_R0Alpha":
         self.sampling_rate_hz = 250e6  # 250 MHz for sst1m
@@ -165,6 +180,24 @@ class TriggerChain:
     # skips fadc gets a single-input model instead of a Keras "inputs not
     # connected to outputs" error.
     self._baseline_connected = False
+
+  def _require_full_datacube(self):
+    """Raise if the chain takes fewer samples than the files hold (``num_samples=``).
+
+    Every method that reads the files itself needs the whole datacube: with a shorter
+    input it would not know which samples to keep, and a reshape would succeed silently
+    while mixing samples of different pixels.
+    """
+    if self.num_samples != self.file_num_samples:
+        raise ValueError(
+            f"this chain takes {self.num_samples} samples but the files hold "
+            f"{self.file_num_samples}; it cannot read the files itself. Feed it through "
+            "triggerkit.cascade.TriggerCascade with a window of that length.")
+
+  def _reshape_waveform(self, wf):
+    """(-1, num_pixels, num_samples) view of a raw waveform batch read from the files."""
+    self._require_full_datacube()
+    return tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
 
   def model_inputs(self):
     """Keras inputs of a model built on this chain, as ``Model(inputs=...)`` wants them.
@@ -622,7 +655,7 @@ class TriggerChain:
         ped = tf.cast(ped, tf.int32)
 
         # Force exactly the ranks/shapes the model expects
-        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))  # -> (B,1296,50)
+        wf  = self._reshape_waveform(wf)  # -> (B,1296,50)
         ped = tf.reshape(ped, (-1, self.num_pixels))                   # -> (B,1296)
 
         if expects_baseline:
@@ -779,6 +812,8 @@ class TriggerChain:
     # --------------------------------------------------------------
     # Dataset builder for autoencoder
     # --------------------------------------------------------------
+    self._require_full_datacube()
+
     def _normalize_waveform(arr):
         wf = np.asarray(arr)
         if wf.ndim == 3:
@@ -955,7 +990,7 @@ class TriggerChain:
         wf  = tf.cast(features["waveform"], tf.uint16)
         ped = tf.cast(features["pedestal"], tf.int32)
 
-        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
+        wf  = self._reshape_waveform(wf)
         ped = tf.reshape(ped, (-1, self.num_pixels))
         y   = tf.reshape(tf.cast(y_true, tf.float32), (-1, self.num_pixels))
 
@@ -1215,7 +1250,7 @@ class TriggerChain:
         wf  = tf.cast(features["waveform"], tf.uint16)
         ped = tf.cast(features["pedestal"], tf.int32)
 
-        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
+        wf  = self._reshape_waveform(wf)
         ped = tf.reshape(ped, (-1, self.num_pixels))
 
         y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
@@ -1756,7 +1791,7 @@ class TriggerChain:
         wf  = tf.cast(features["waveform"], tf.uint16)
         ped = tf.cast(features["pedestal"], tf.int32)
 
-        wf  = tf.reshape(wf, (-1, self.num_pixels, self.num_samples))
+        wf  = self._reshape_waveform(wf)
         ped = tf.reshape(ped, (-1, self.num_pixels))
 
         y   = tf.reshape(tf.cast(label, tf.int32), (-1,))
@@ -1917,7 +1952,7 @@ class TriggerChain:
         pass
 
     def pack(features, label):
-        wf = tf.reshape(tf.cast(features["waveform"], tf.uint16), (-1, self.num_pixels, self.num_samples))
+        wf = self._reshape_waveform(tf.cast(features["waveform"], tf.uint16))
         ped = tf.reshape(tf.cast(features["pedestal"], tf.int32), (-1, self.num_pixels))
         y = tf.reshape(tf.cast(label, tf.int32), (-1,))
         if expects_baseline:
